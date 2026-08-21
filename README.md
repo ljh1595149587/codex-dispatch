@@ -84,6 +84,7 @@ codex_review_attack.md
 | 对原生 exe 用 `2>&1` | PS 5.1 把每行 stderr 包成 `NativeCommandError`，配 `$ErrorActionPreference='Stop'` 会让一行无害提示终止脚本 | stderr 在 cmd 层丢弃 |
 | `Tee-Object` 给首行加 BOM | 过滤器 `startswith("{")` 丢掉 `thread.started` | 过滤器 `lstrip("\ufeff")` |
 | PS 管道到原生 exe 用 `$OutputEncoding`（5.1 默认 ASCII） | 非 ASCII 字符被压成 `?` | 测编码相关行为要经文件+重定向，别用管道 |
+| **PS 按控制台代码页解码原生 exe 的输出**（中文 Windows = 936） | UTF-8 多字节被按 GBK 拆开，落盘的 JSONL 有 U+FFFD、整行解析失败。**报告文件不受影响**（codex 自己写），只在回头查事件流时才暴露 | 管道和落盘都留在 cmd/python 一侧，过滤器用 `--tee` 自己写文件 |
 | PowerShell 没有 `< file` 输入重定向 | `<` 是保留字符 | 用 `cmd /c` 承接 |
 
 **最贵的一条是第一条。** 它静默失败四轮，每一轮我都归因成模型行为问题

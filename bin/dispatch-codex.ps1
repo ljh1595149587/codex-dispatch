@@ -139,13 +139,23 @@ function Invoke-CodexOnce {
 
     $f = @((Join-Path $PSScriptRoot 'codex_stream.py'))
     if ($Budget -gt 0) { $f += @('--budget', $Budget) }
+    $f += @('--tee', $raw)
 
     # PowerShell 没有 `< file` 输入重定向 —— `<` 是保留字符。用 cmd /c 承接。
     # 注意 /c 后面必须整体加引号，否则 cmd 只吃到第一个词。
     $argLine = ($a | ForEach-Object {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     }) -join ' '
-    $cmdLine = '"' + $codex + '" ' + $argLine + ' <"' + $pf + '" 2>NUL'
+    $fLine = ($f | ForEach-Object {
+        if ("$_" -match '[\s"]') { '"' + ("$_" -replace '"', '\"') + '"' } else { "$_" }
+    }) -join ' '
+
+    # 管道和落盘都留在 cmd/python 一侧，不经 PowerShell。
+    # PS 会按**控制台代码页**解码原生 exe 的输出 —— 中文 Windows 上是 936，
+    # UTF-8 的多字节序列被按 GBK 拆开，非 ASCII 成对损坏。原先用 Tee-Object
+    # 落盘，存下来的 JSONL 有 32 处 U+FFFD、整行解析失败，事后复查时证据已经烂了。
+    # 报告文件由 codex 自己写，不受影响，所以这个损坏只在「回头查事件流」时才暴露。
+    $cmdLine = '"' + $codex + '" ' + $argLine + ' <"' + $pf + '" 2>NUL | "' + $py + '" -u ' + $fLine
 
     # 不要在 PowerShell 层写 `2>&1` —— PS 5.1 会把原生 exe 的每行 stderr 包成
     # NativeCommandError，叠加 $ErrorActionPreference='Stop' 会让一行无害提示
@@ -154,14 +164,11 @@ function Invoke-CodexOnce {
     #
     # 过滤器的输出用 Out-Host 直通终端：走管道会被 PS 缓冲，实测失败信息
     # （如 "at capacity"）在任务结束前完全看不到，等于白建这个过滤器。
-    & cmd.exe /c $cmdLine |
-        Tee-Object -FilePath $raw -Append |
-        & $py -u @f |
-        Out-Host
+    & cmd.exe /c $cmdLine | Out-Host
 
     # 送达自检：prompt 丢失过四轮而全程无报错，只表现为「它没照做」。
     # 用 input_tokens 兜底 —— prompt 少几百 token 看不出来，但整段丢失看得出来。
-    $ev = if (Test-Path $raw) { Get-Content $raw -Raw } else { '' }
+    $ev = if (Test-Path $raw) { [System.IO.File]::ReadAllText($raw, [System.Text.UTF8Encoding]::new($false)) } else { '' }
     if ($ev -match '"input_tokens":\s*(\d+)') {
         $inTok = [int]$Matches[1]
         $expect = [int]($Prompt.Length / 3)

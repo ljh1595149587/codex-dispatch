@@ -36,11 +36,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--budget", type=int, default=0,
                     help="token 预算，超出时输出告警行（0 表示不检查）")
+    ap.add_argument("--tee", default="",
+                    help="把原始事件行另存一份到此路径（UTF-8）")
     args = ap.parse_args()
 
     # Windows 默认 GBK，中文命令/消息会编码失败。强制 UTF-8。
     out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
     stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+
+    # 落盘由本进程做，不用 PowerShell 的 Tee-Object。
+    # 原因：PS 会先按**控制台代码页**解码原生 exe 的输出，中文 Windows 上那是
+    # 936 —— UTF-8 的多字节序列被按 GBK 拆开，非 ASCII 字符成对损坏，落盘的
+    # JSONL 直接解析失败。事后想复查事件流时才发现证据已经烂了。
+    # 全程留在 UTF-8 字节域：cmd 负责管道，python 负责落盘。
+    tee = None
+    if args.tee:
+        tee = io.open(args.tee, "a", encoding="utf-8", newline="\n")
     warned = False
     ncmd = 0
 
@@ -48,6 +59,9 @@ def main():
         # PowerShell 的 Tee-Object 会给首行加 BOM，﻿ 开头的行不以 { 开头，
         # 会被下面的判断整行丢掉 —— 而那正好是 thread.started。
         line = line.lstrip("﻿").strip()
+        if tee is not None and line:
+            tee.write(line + "\n")
+            tee.flush()
         if not line.startswith("{"):
             continue
         try:
@@ -112,6 +126,9 @@ def main():
                     warned = True
                     print("[codex] 预算告警：已用 %s tok，超过 %s" % (total, args.budget),
                           file=out, flush=True)
+
+    if tee is not None:
+        tee.close()
 
 
 if __name__ == "__main__":

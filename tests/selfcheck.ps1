@@ -99,6 +99,7 @@ if ($py) {
     $ev = @(
         "$bom{`"type`":`"thread.started`",`"thread_id`":`"abc123`"}"
         '{"type":"turn.started"}'
+        '{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"返回类型是 dict 的函数签名"}}'
         '{"type":"error","message":"Selected model is at capacity. Please try a different model."}'
         '{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":10}}'
     ) -join "`n"
@@ -109,7 +110,28 @@ if ($py) {
     Check "BOM 首行仍被解析（thread.started）" ($res -match 'abc123') "Tee-Object 给首行加 BOM"
     Check "识别上游容量问题" ($res -match '容量|capacity') "否则会被误判成 prompt 有问题"
     Check "输出用量" ($res -match '1000|共')
-    Remove-Item $evf -ErrorAction SilentlyContinue
+
+    # 落盘编码：PS 按控制台代码页（中文 Windows 是 936）解码原生 exe 的输出，
+    # 用 Tee-Object 存下来的 UTF-8 会被按 GBK 拆坏 —— 实测 32 处 U+FFFD、整行
+    # 解析失败。落盘必须由 python 自己做，全程留在 UTF-8 字节域。
+    $teef = Join-Path $tmp 'cxtee.jsonl'
+    Remove-Item $teef -ErrorAction SilentlyContinue
+    $null = & cmd.exe /c ('"' + $py + '" -u "' + $filter + '" --tee "' + $teef + '" <"' + $evf + '" 2>NUL')
+    $tb = if (Test-Path $teef) { [System.IO.File]::ReadAllBytes($teef) } else { @() }
+    $strict = $false
+    try { $null = [System.Text.UTF8Encoding]::new($false, $true).GetString($tb); $strict = $tb.Length -gt 0 } catch { }
+    Check "--tee 落盘是合法 UTF-8（$($tb.Length)B）" $strict "过滤器自己落盘，不经 PowerShell 管道"
+    $tt = if ($tb.Length) { [System.Text.Encoding]::UTF8.GetString($tb) } else { '' }
+    Check "--tee 中文原样保留" ($tt -match '返回类型是 dict 的函数签名') "GBK 拆坏时这里会是 U+FFFD"
+
+    # 只匹配真正的调用（行首非注释处的管道调用），注释里提这个名字是允许的 ——
+    # 那条注释正是解释为什么不能用它。
+    $usesTee = (Get-Content $script -Encoding UTF8 |
+        Where-Object { $_ -notmatch '^\s*#' -and $_ -match '\|\s*Tee-Object' }).Count -gt 0
+    Check "脚本不再用 Tee-Object 落盘" (-not $usesTee) `
+        "PS 管道会按控制台代码页解码，中文被拆坏"
+
+    Remove-Item $evf, $teef -ErrorAction SilentlyContinue
 }
 
 Write-Host "`n[5] 参数契约" -ForegroundColor Cyan
