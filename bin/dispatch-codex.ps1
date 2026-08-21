@@ -1,7 +1,7 @@
 ﻿# 派 Codex 干活，事件流式输出，最终报告落盘。跨项目通用，无项目专有假设。
 #
 # 用法（-Root 缺省时用当前工作目录作项目根）：
-#   $D = 'd:\work\codex-dispatch\bin\dispatch-codex.ps1'
+#   $D = "$env:USERPROFILE\.claude\skills\codex-dispatch\bin\dispatch-codex.ps1"
 #   & $D -Mode read  -Prompt "复核 X 的结论"
 #   & $D -Mode write -Cwd src -Prompt "给 parsers 补测试" -Budget 200000
 #   & $D -Review "src/a.py src/b.py"        # 找 → 攻 两轮

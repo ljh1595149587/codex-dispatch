@@ -2,6 +2,9 @@
 
 派 Codex 干活的 CLI。Windows / PowerShell 环境，跨项目通用。
 
+本仓库同时是一个 Claude Code skill（`SKILL.md` 在根目录），装在
+`~/.claude/skills/codex-dispatch/`。skill 加载时读 `SKILL.md`，人和 CLI 用户读本文件。
+
 Claude 用它把「读多写少的探索」和「有机器可判定验收标准的机械活」外包给 Codex，
 自己保留判断和验收。**用户不和 Codex 打交道** —— 驾驭它的成本全部落在 Claude 这边。
 
@@ -10,7 +13,7 @@ Claude 用它把「读多写少的探索」和「有机器可判定验收标准�
 不用装。脚本自带依赖检测（codex 原生 exe、python），路径写死在脚本里、找不到会自动搜。
 
 ```powershell
-$D = 'd:\work\codex-dispatch\bin\dispatch-codex.ps1'
+$D = "$env:USERPROFILE\.claude\skills\codex-dispatch\bin\dispatch-codex.ps1"
 ```
 
 ## 用
