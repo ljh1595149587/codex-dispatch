@@ -141,5 +141,45 @@ foreach ($p in @('Mode', 'Prompt', 'Review', 'Round2Only', 'Root', 'Cwd', 'Budge
 }
 Check "-Root 默认当前目录（脚本已脱离项目树）" ($sig.Parameters['Root'].Attributes.Count -ge 0)
 
+Write-Host "`n[6] 自引用不变量" -ForegroundColor Cyan
+# 改名/搬家的成本全部落在硬编码的自引用上，且它们不报错、只静默失配。
+# 上一次搬家（d:\work\ → skills 目录）在 settings.local.json 里留下约 20 条
+# 指向死路径的权限条目，至今没清。所以这里禁止任何文件按目录名写死 skill 路径：
+# 要引用自身就用 bin\dispatch-codex.ps1 这个文件名去 glob（见 SKILL.md 顶部）。
+# 允许 `skills\*\`（glob 形式），禁止 `skills\具体名字\`。
+$selfRef = @()
+$scan = Get-ChildItem $repo -Recurse -File -Include *.md, *.ps1, *.py |
+    Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' }
+foreach ($f in $scan) {
+    $txt = [System.IO.File]::ReadAllText($f.FullName)
+    foreach ($m in [regex]::Matches($txt, '\.claude[\\/]skills[\\/][^*\s\\/]+[\\/]')) {
+        $selfRef += "$($f.Name) → $($m.Value)"
+    }
+}
+Check "无按目录名硬编码的 skill 路径" ($selfRef.Count -eq 0) ($selfRef -join ' ; ')
+
+Write-Host "`n[7] 派错树的守卫" -ForegroundColor Cyan
+# 实测踩过：-Root 缺省取当前 cwd，后台任务的 cwd 落在本 skill 自己的目录，
+# Codex 只读跑遍工具链自身、找不到目标文件，烧掉 62k token 才报「工作区没有该文件」。
+# 派活方在后台看不到那行「目录 ...」提示，于是失败长得像「Codex 做不到」而非「派错了树」。
+# 静默派错比派失败贵：它会跑完、会花钱、会给出一个自洽的错误结论。
+$guardTmp = Join-Path ([IO.Path]::GetTempPath()) ("dispatch-guard-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $guardTmp -Force | Out-Null
+try {
+    # 守卫一：项目根落在 skill 自己的目录 → 必须拒绝。
+    # 注意这条不能用「是不是 git 仓库」代替 —— 本 skill 目录自己就是 git 仓库。
+    $out = & powershell -NoProfile -File $script -Mode read -Prompt 'x' -Root $repo 2>&1 | Out-String
+    Check "项目根 = skill 目录时拒绝" ($LASTEXITCODE -eq 1 -and $out -match '本 skill 自己的目录') $out.Trim()
+
+    # 守卫二：非 git 仓库 → 必须拒绝（验收纪律全建立在 git 上）
+    $out = & powershell -NoProfile -File $script -Mode read -Prompt 'x' -Root $guardTmp 2>&1 | Out-String
+    Check "项目根不是 git 仓库时拒绝" ($LASTEXITCODE -eq 1 -and $out -match '不是 git 仓库') $out.Trim()
+
+    # 两道守卫都必须在调用 Codex 之前生效，否则拦住了也已经花过钱了
+    Check "守卫先于 Codex 调用（未产生事件流）" (-not (Test-Path (Join-Path $guardTmp '.codex-stream.jsonl')))
+} finally {
+    Remove-Item $guardTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "`n通过 $pass，失败 $fail`n" -ForegroundColor $(if ($fail) { 'Red' } else { 'Green' })
 exit $(if ($fail) { 1 } else { 0 })

@@ -1,7 +1,7 @@
 ﻿# 派 Codex 干活，事件流式输出，最终报告落盘。跨项目通用，无项目专有假设。
 #
 # 用法（-Root 缺省时用当前工作目录作项目根）：
-#   $D = "$env:USERPROFILE\.claude\skills\codex-dispatch\bin\dispatch-codex.ps1"
+#   $D = (Get-ChildItem "$env:USERPROFILE\.claude\skills\*\bin\dispatch-codex.ps1").FullName
 #   & $D -Mode read  -Prompt "复核 X 的结论"
 #   & $D -Mode write -Cwd src -Prompt "给 parsers 补测试" -Budget 200000
 #   & $D -Review "src/a.py src/b.py"        # 找 → 攻 两轮
@@ -55,6 +55,30 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path $Root).Path
+
+# -Root 缺省是「当前工作目录」，而后台任务、嵌套 shell 的 cwd 常常不是项目根。
+# 实测踩过：cwd 落在本 skill 自己的目录，Codex 只读跑遍了工具链自身、找不到目标
+# 文件，烧掉 62k token 才在报告里说「当前工作区不存在该文件」。派活方在后台看不到
+# 那行「目录 ...」提示，于是这个失败长得像「Codex 做不到」而不是「派错了树」。
+# 静默派错比派失败贵：它会跑完、会花钱、会给出一个自洽的错误结论。
+$skillRoot = (Split-Path -Parent $PSScriptRoot).TrimEnd('\')
+$rootCmp = $root.TrimEnd('\')
+if ($rootCmp -eq $skillRoot -or $rootCmp.StartsWith($skillRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    Write-Host "拒绝：项目根解析到了本 skill 自己的目录" -ForegroundColor Red
+    Write-Host "  $root" -ForegroundColor DarkGray
+    Write-Host "八成是 -Root 缺省取了当前 cwd。显式传 -Root <项目根> 再来。" -ForegroundColor Yellow
+    exit 1
+}
+# 注意：上面那条不能用「是不是 git 仓库」代替 —— 本 skill 目录自己就是 git 仓库，
+# 这条查不出来。两道守卫各拦一类，缺一不可。
+if (-not (Test-Path (Join-Path $root '.git'))) {
+    Write-Host "拒绝：项目根不是 git 仓库" -ForegroundColor Red
+    Write-Host "  $root" -ForegroundColor DarkGray
+    Write-Host "本工具的验收纪律全建立在 git 上（工作树检查、diff 验收）。" -ForegroundColor Yellow
+    Write-Host "显式传 -Root <项目根>。" -ForegroundColor Yellow
+    exit 1
+}
+
 $target = Resolve-Path (Join-Path $root $Cwd)
 
 # 审查模式固定只读，不走 $Mode

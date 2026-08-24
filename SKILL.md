@@ -1,6 +1,6 @@
 ---
 name: codex-dispatch
-description: 把任务外包给 Codex 执行（只读探索、批量机械活、两轮代码审查），Claude 负责派活与验收，用户不和 Codex 打交道。当用户说"派给 codex""让 codex 看看""codex 审查""外包给 codex""用 codex 跑"，或当前任务是"读多写少的探索"/"有验收命令可判定成败的批量活"时使用。触发词：codex、派活、外包、两轮审查、codex review、独立复核
+description: 把任务外包给 Codex 执行（只读探索、批量机械活、两轮代码审查），Claude 负责派活与验收，用户不和 Codex 打交道。当用户说"派给 codex""让 codex 看看""codex 审查""外包给 codex""用 codex 跑"时使用。**更要在没人开口时主动自查** —— 命中以下任一条就停下来问「这批能不能一次派清」：准备写第 2 个分析脚本（查日志/查库/统计分布）、连续读第 2 个大文件或整份日志、要补一整套测试、要对同一批数据做第 2 轮口径不同的统计。触发词：codex、派活、外包、两轮审查、codex review、独立复核
 user-invocable: true
 allowed-tools: "Bash, Read, Edit, Write, Grep, Glob, PowerShell"
 ---
@@ -11,9 +11,13 @@ allowed-tools: "Bash, Read, Edit, Write, Grep, Glob, PowerShell"
 设计理由都在那里，本文件只放调用方式和不变量。
 
 ```powershell
-$S = "$env:USERPROFILE\.claude\skills\codex-dispatch"
-$D = "$S\bin\dispatch-codex.ps1"
+# 按文件名发现，不认目录名 —— 本 skill 改名后这两行仍然有效
+$D = (Get-ChildItem "$env:USERPROFILE\.claude\skills\*\bin\dispatch-codex.ps1").FullName
+$S = Split-Path (Split-Path $D -Parent) -Parent
 ```
+
+**这是全仓唯一允许写出 skill 路径的地方**，其余一律从 `$S` / `$D` 派生。
+自检 [6] 会拦住按目录名硬编码的路径 —— 理由见 README「改名清单」。
 
 ## 第一原则：用户不和 Codex 打交道
 
@@ -41,6 +45,34 @@ $D = "$S\bin\dispatch-codex.ps1"
 
 首次在某项目用之前：把 `$S\templates\AGENTS.md` 拷到项目根，
 并把产出物加进 `.gitignore`（清单见 README）。
+
+**走 codex MCP（不用 CLI）时，每次都要带齐三件套**：`sandbox`、`cwd`、
+`developer-instructions`。少任何一个都会静默退化 —— `sandbox` 缺省档位不可知、
+`cwd` 缺省会让写权限落到整个仓库、`developer-instructions` 缺省则一次性约束全丢。
+CLI 路径由脚本代填这三项，MCP 路径没有这层兜底，**送达自检也要自己看用量**。
+
+多轮细化用 `codex-reply` 留在它的线程里，只有收敛后的最终版进 Claude 的上下文。
+
+## 什么时候停下来问「这个该不该派」
+
+**判据不缺，缺的是触发时机。** 实测两次漏派都不是判错，是判断流程**压根没启动**：
+
+- 2026-08-21 诊断 Google 不可达时，日志与 sqlite 的批量分析全在主线程逐行做完
+- 2026-08-24 修缺陷 #6 时，又是日志分析 + 三个 sqlite 查询脚本，全程没想起派活
+
+两次同一个机制：**高频往返的会话节奏里，本能是顺手做完**，而分析任务是滚雪球长出来的，
+每一步看着都只是「就查一下」。等回过神已经烧掉了本该留给用户的上下文。
+
+所以触发点必须是**可数的动作**，不能是「这活属于哪一类」—— 后者永远可以自辩成「不算探索」：
+
+- 准备写**第 2 个**分析脚本（查日志、查库、统计分布）
+- 连续读**第 2 个**大文件或整份日志
+- 要**补一整套测试**（不是往现有文件加一两条断言）
+- 要对同一批数据做**第 2 轮**口径不同的统计
+
+命中任意一条就停下来问一句「这批能不能一次派清」。答案是「不能」也没关系 ——
+**问过再自己做是决策，没问过就自己做是遗漏。** 后者在任何日志里都不留痕，
+只能靠事后复盘补，而复盘不会每次都发生。
 
 ## 判断要不要外包
 
@@ -74,10 +106,10 @@ $D = "$S\bin\dispatch-codex.ps1"
 ## 改了脚本就跑自检
 
 ```powershell
-powershell -NoProfile -File "$env:USERPROFILE\.claude\skills\codex-dispatch\tests\selfcheck.ps1"
+powershell -NoProfile -File "$S\tests\selfcheck.ps1"
 ```
 
-19 项全离线，不花额度。
+全离线，不花额度、不联网。（不在这里写条数 —— 会随加测试漂移。）
 
 ## 派活日志
 
@@ -85,4 +117,10 @@ powershell -NoProfile -File "$env:USERPROFILE\.claude\skills\codex-dispatch\test
 掺水什么、验收时发现了它没说的什么、教训。**考虑过但决定自己做的活也记一行**
 （防幸存者偏差）。由 Claude 写，不让 Codex 自评。
 
-改规则的门槛：**同一问题 ≥2 次**才动，单次是噪声。
+**优化模式**：攒到十来条后，把日志丢给 Codex 只读评估（这活它没立场、纯读、
+边界清晰，性价比高），问三件事 —— 哪类任务采纳率高/低、有没有同一失败重复出现、
+现有规则里哪条从没被触发过（**没用上的规则是纯上下文税，该删**）。
+
+改规则的门槛：**同一问题 ≥2 次**才动，单次是噪声。加规则时先问能不能删一条或并一条。
+
+日志按项目各存各的，**跨项目不合并** —— 不同项目的任务构成不同，采纳率不可比。

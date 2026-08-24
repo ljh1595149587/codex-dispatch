@@ -2,8 +2,8 @@
 
 派 Codex 干活的 CLI。Windows / PowerShell 环境，跨项目通用。
 
-本仓库同时是一个 Claude Code skill（`SKILL.md` 在根目录），装在
-`~/.claude/skills/codex-dispatch/`。skill 加载时读 `SKILL.md`，人和 CLI 用户读本文件。
+本仓库同时是一个 Claude Code skill（`SKILL.md` 在根目录），装在 `~/.claude/skills/`
+下（目录名即 skill 名）。skill 加载时读 `SKILL.md`，人和 CLI 用户读本文件。
 
 Claude 用它把「读多写少的探索」和「有机器可判定验收标准的机械活」外包给 Codex，
 自己保留判断和验收。**用户不和 Codex 打交道** —— 驾驭它的成本全部落在 Claude 这边。
@@ -13,7 +13,8 @@ Claude 用它把「读多写少的探索」和「有机器可判定验收标准�
 不用装。脚本自带依赖检测（codex 原生 exe、python），路径写死在脚本里、找不到会自动搜。
 
 ```powershell
-$D = "$env:USERPROFILE\.claude\skills\codex-dispatch\bin\dispatch-codex.ps1"
+# 按文件名发现，不认目录名 —— 本 skill 改名后这行仍然有效
+$D = (Get-ChildItem "$env:USERPROFILE\.claude\skills\*\bin\dispatch-codex.ps1").FullName
 ```
 
 ## 用
@@ -86,6 +87,12 @@ codex_review_attack.md
 | PS 管道到原生 exe 用 `$OutputEncoding`（5.1 默认 ASCII） | 非 ASCII 字符被压成 `?` | 测编码相关行为要经文件+重定向，别用管道 |
 | **PS 按控制台代码页解码原生 exe 的输出**（中文 Windows = 936） | UTF-8 多字节被按 GBK 拆开，落盘的 JSONL 有 U+FFFD、整行解析失败。**报告文件不受影响**（codex 自己写），只在回头查事件流时才暴露 | 管道和落盘都留在 cmd/python 一侧，过滤器用 `--tee` 自己写文件 |
 | PowerShell 没有 `< file` 输入重定向 | `<` 是保留字符 | 用 `cmd /c` 承接 |
+| **`Get-Content` 吞掉行尾中文后面的换行符**（无 BOM 的 UTF-8） | 多行静默并成一行，行数**少一大截**且不报错。实测 101 行的 `SKILL.md` 读成 65 行 | 数行数/读文本用 `wc -l`、`python`，别用 `Get-Content`。或给文件加 BOM（`AGENTS.md` 有 BOM，实测计数正确） |
+| `Measure-Object -Line` 不计空行 | markdown 行数看着比实际少三成 | 同上，用 `wc -l` |
+| **`-Root` 缺省取当前 cwd，而后台任务的 cwd 不是项目根** | 实测：cwd 落在本 skill 自己的目录，Codex 只读跑遍工具链自身、找不到目标文件，**烧掉 62k token** 才报「工作区不存在该文件」。派活方在后台看不到那行「目录 ...」提示，失败长得像「Codex 做不到」 | 脚本已加两道守卫（skill 目录 / 非 git 仓库直接拒绝，见自检 [7]）。**派活时习惯性显式传 `-Root`** |
+
+**静默派错比派失败贵。** 派失败当场没结果；派错树会跑完、会花钱、会给出一个
+自洽的错误结论 —— 而那个结论读起来完全像是模型能力不足。
 
 **最贵的一条是第一条。** 它静默失败四轮，每一轮我都归因成模型行为问题
 （「它偷懒」「它复述」），还据此改了四遍措辞、得出过关于模型倾向的结论 ——
@@ -101,7 +108,8 @@ codex_review_attack.md
 powershell -NoProfile -File tests\selfcheck.ps1
 ```
 
-19 项，全离线 —— 不调 Codex、不花额度、不联网。**改脚本后先跑这个。**
+全离线 —— 不调 Codex、不花额度、不联网。**改脚本后先跑这个。**
+（不写条数：会随加测试漂移，写死了就是下一个待修的不一致。）
 
 其中「命令行参数路径确实会截断」是**回归哨兵**：它断言坏行为仍然存在。
 若哪天它失败了，说明 cmd 行为变了，可以重新评估实现 —— 但别默默放宽。
@@ -110,12 +118,37 @@ powershell -NoProfile -File tests\selfcheck.ps1
 
 - **验收不采信它的完成报告**，只看 `git diff` 和验收命令的实际输出。它声称「未验证」的当未完成
 - **一次派清、一次读完的才外包。** 需要来回拉扯的自己做 —— 拉扯烧的是 Claude 的上下文
-- **显式给报告字数上限。** 实测倍率只有 3–4 倍，且**天花板由报告长度决定，不由源码长度决定**
+- **显式给报告字数上限。** 实测倍率只有 3–4 倍，且**天花板由报告长度决定，不由源码长度决定**。
+  但这条规则第一次受检就没守住：2026-08-24 给了「≤4KB」，交回 5238 字节，**超 30%**。
+  上限是软约束，验收时自己量一下，别假定它守了
 - **稳定的约束写 `AGENTS.md`，一次性的才写 prompt。** 实测：prompt 里的格式要求被传输层吃掉了，
   它照样输出合规表格 —— 起作用的是 `AGENTS.md`，它自己会读
 - **不该外包**：小改动、需要来回澄清的模糊需求、核心逻辑改动（逐行看的成本 > 自己写）
 
 `templates\AGENTS.md` 是给新项目用的模板，拷进项目根后按需裁剪。硬预算 ≤120 行。
+
+## 改名清单
+
+这个 skill 迟早要改名 —— 一旦接入第二个后端（Gemini 等），`codex-dispatch`
+就和内容自相矛盾了。`name` / `description` 不是标签，是**检索键**：找不到就等于没有。
+
+**改名时只需要动这四处**（自检 [6] 保证不会有第五处）：
+
+1. `SKILL.md` 的 `name:` 字段 —— 必须与目录名一致
+2. `README.md` 的标题
+3. 目录名本身（git 仓库跟着走，历史不受影响）
+4. **消费方项目里的活指针** —— 各项目 `CLAUDE.md` / memory 里指过来的那一行
+
+**已经免疫的**：`bin/dispatch-codex.ps1` 用 `$PSScriptRoot` 自定位；`SKILL.md` /
+`README.md` 用文件名 glob 发现自己。**别再引入按目录名硬编码的路径。**
+
+**不要动的**：各项目 `docs/dispatch-log.md`、`progress.md` 里的历史条目。那是当时的
+事实记录，改名不是追溯性的 —— 重写历史等于毁掉记录。
+
+**会被漏掉的**：`~/.claude/settings.local.json` 里按路径写死的权限条目。
+它们不会报错，只会静默失配、重新开始弹确认框。**每次搬家前先 grep 一遍它**，
+把死条目一并清掉 —— 上一次从 `d:\work\` 搬到 `~/.claude/skills/` 就没清，
+至今留着约 20 条指向已不存在路径的条目。
 
 ## 派活日志
 
