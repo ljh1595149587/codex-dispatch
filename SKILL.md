@@ -74,6 +74,11 @@ $S = Split-Path (Split-Path $D -Parent) -Parent
 首次在某项目用之前：把 `$S\templates\AGENTS.md` 拷到项目根，
 并把产出物加进 `.gitignore`（清单见 README）。
 
+**在一个会话里新建项目（新目录）时，先 `git init`**：钩子按「文件所在 git 仓库」认项目，
+不是仓库的目录里的改动不进统计、也不受任何档位约束；写模式派活本来也要求干净的 git 工作树。
+往别的项目派活（`-Root` 指向它）照样记在当前会话：记账按环境变量 `CLAUDE_CODE_SESSION_ID` 认会话，
+不按项目根猜，所以之后在新项目里另开会话也不会把这次认走。
+
 **走 codex MCP（不用 CLI）时，每次都要带齐三件套**：`sandbox`、`cwd`、
 `developer-instructions`。少任何一个都会静默退化 —— `sandbox` 缺省档位不可知、
 `cwd` 缺省会让写权限落到整个仓库、`developer-instructions` 缺省则一次性约束全丢。

@@ -32,8 +32,13 @@ class Env(unittest.TestCase):
         self._old = os.environ.get("CODEX_DISPATCH_HOME")
         os.environ["CODEX_DISPATCH_HOME"] = self.home
         os.environ.pop("CODEX_DISPATCH_HOOK_DEBUG", None)
+        # 在 Claude Code 里跑测试时会继承真实会话 ID，CLI 会改记到那个会话上
+        self._old_sid = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 
     def tearDown(self):
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        if self._old_sid is not None:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = self._old_sid
         if self._old is None:
             os.environ.pop("CODEX_DISPATCH_HOME", None)
         else:
@@ -637,6 +642,65 @@ class TestCwdDrift(Env):
         bash = lambda: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}})  # noqa: E731
         self.assertIsNone(bash())
         self.assertIsNotNone(bash())
+
+    def _record_codex(self, root, sid=None):
+        env = os.environ.copy()
+        if sid:
+            env["CLAUDE_CODE_SESSION_ID"] = sid
+        p = subprocess.run([sys.executable, POLICY, "--cwd", root, "record-codex", "--mode", "read"],
+                           capture_output=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace"))
+
+    def test_codex_run_into_new_project_counts_for_dispatching_session(self):
+        # 在 proj 的会话里新建项目 other 并往它派活；other 里随后开了会话 s2，也不能把这次认走
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.hook("session-start", {"session_id": "s2", "cwd": self.other})
+        self._record_codex(self.other, sid="s1")
+        self.assertIn("Codex 派活 1 次", self.hook("stop", {})["systemMessage"])
+        self.assertIsNone(self.hook("stop", {"session_id": "s2", "cwd": self.other}))   # s2 什么都没做
+
+    def _cli(self, root, sid, *args):
+        env = dict(os.environ, CLAUDE_CODE_SESSION_ID=sid)
+        p = subprocess.run([sys.executable, POLICY, "--cwd", root] + list(args), capture_output=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace"))
+
+    def test_cross_project_relative_waiver_applies_to_that_project(self):
+        # 会话起始于 proj，在 other 里 decide self --files src/x.go：放行 other/src/x.go，不放行 proj/src/x.go
+        for root in (self.proj, self.other):
+            os.makedirs(os.path.join(root, ".claude"), exist_ok=True)
+            with open(os.path.join(root, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+                json.dump({"level": 3}, f)
+        self.hook("session-start", {})
+        self._cli(self.other, "s1", "decide", "self", "--reason", "小修", "--files", "src/x.go")
+        pre = lambda p: self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {"file_path": p}})  # noqa: E731
+        self.assertIsNone(pre(os.path.join(self.other, "src", "x.go")))
+        self.assertEqual(pre(os.path.join(self.proj, "src", "x.go"))["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_cross_project_blanket_waiver_stays_in_that_project(self):
+        for root in (self.proj, self.other):
+            os.makedirs(os.path.join(root, ".claude"), exist_ok=True)
+            with open(os.path.join(root, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+                json.dump({"level": 3}, f)
+        self.hook("session-start", {})
+        self._cli(self.other, "s1", "decide", "self", "--reason", "整体小修")
+        pre = lambda p: self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {"file_path": p}})  # noqa: E731
+        self.assertIsNone(pre(os.path.join(self.other, "a.go")))
+        self.assertEqual(pre(os.path.join(self.proj, "a.go"))["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_override_in_new_project_binds_to_env_session(self):
+        # 在 s1 里给新项目 other 临时调档位；other 里随后开的 s2 不能认走
+        self.hook("session-start", {})
+        self._cli(self.other, "s1", "override", "--level", "3")
+        self.hook("session-start", {"session_id": "s2", "cwd": self.other})
+        self.assertEqual(dp.resolve(self.other, "s2")["effective"], 1)
+        self.assertEqual(dp.resolve(self.other, "s1")["effective"], 3)
+
+    def test_codex_run_without_env_falls_back_to_project_lookup(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self._record_codex(self.proj)
+        self.assertIn("Codex 派活 1 次", self.hook("stop", {})["systemMessage"])
 
     def test_old_single_snapshot_state_migrates(self):
         self.proj_cfg({"level": 3})

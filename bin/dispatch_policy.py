@@ -480,9 +480,12 @@ def active_waiver(st, path):
         if w.get("until", 0) < now:
             continue
         files = w.get("files")
+        root = w.get("root") or st["project"]
         if not files:
-            return w
-        if any(_same_file(path, f, st["project"]) for f in files):
+            if rel_in_root(path, root) is not None:     # 不限文件的豁免也只管登记时那个项目
+                return w
+            continue
+        if any(_same_file(path, f, root) for f in files):
             return w
     return None
 
@@ -598,8 +601,14 @@ def cmd_status(a):
 
 
 def _cli_sid(a, root):
+    """CLI 记到哪个会话：--session > 环境变量 CLAUDE_CODE_SESSION_ID > 按项目根找最近的会话。
+    Claude Code 给 Bash / PowerShell 子进程导出 CLAUDE_CODE_SESSION_ID（10-26 实测），派活脚本里调的 record-codex
+    也能拿到。只按项目根找会漏记 / 错记：-Root 是临时克隆、从 A 项目的会话往新项目 N 派活、同一项目开着两个会话。"""
     if getattr(a, "session", None):
         return a.session
+    env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if env_sid:
+        return env_sid
     st = current_session_state(root)
     return st["session_id"] if st else "cli-%d" % os.getpid()
 
@@ -614,7 +623,9 @@ def cmd_decide(a):
         st["decisions"].append(rec)
         st["since_decision"] = {"files": [], "lines": 0, "reminded_at_files": 0}
         if a.choice == "self":
-            st["waivers"].append({"until": now + a.minutes * 60, "files": files or None, "reason": a.reason})
+            # 记下登记时的项目根：会话按环境变量认，跨项目登记时相对路径要按这个根解析，不按会话起始项目
+            st["waivers"].append({"until": now + a.minutes * 60, "files": files or None, "reason": a.reason,
+                                  "root": r["root"]})
     title = "登记：%s（自动）" % ("派给 Codex" if a.choice == "dispatch" else "自己做")
     lines = ["档位：生效 %d（%s %d · 额度 %s）" % (r["effective"], r["level_source"], r["level"], BUDGET_NAMES[r["budget"]]),
              "理由：%s" % a.reason]
@@ -629,7 +640,7 @@ def cmd_decide(a):
 
 def cmd_override(a):
     root = project_root(a.cwd)
-    sid = a.session or (current_session_state(root) or {}).get("session_id")
+    sid = a.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or (current_session_state(root) or {}).get("session_id")
     # 去掉本会话已有的、以及该项目未认领的覆盖；其他会话认领的不动
     items = [o for o in load_overrides()
              if norm(o.get("project", "")) != norm(root) or o.get("session_id") not in (None, sid)]
