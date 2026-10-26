@@ -696,6 +696,84 @@ class TestCwdDrift(Env):
         self.assertEqual(dp.resolve(self.other, "s2")["effective"], 1)
         self.assertEqual(dp.resolve(self.other, "s1")["effective"], 3)
 
+    def _mcp(self, tool="mcp__codex__codex", **tin):
+        tin.setdefault("prompt", "x")
+        return self.hook("post-tool", {"tool_name": tool, "tool_input": tin, "tool_response": {"content": []}})
+
+    def test_mcp_codex_counts_as_dispatch(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        with open(os.path.join(self.proj, "stray.go"), "w") as f:       # 不是这次只读调用改的
+            f.write("package x\n")
+        self.assertIsNone(self.hook("post-tool", {"tool_name": "mcp__codex__codex",
+                                                  "tool_input": {"prompt": "x", "sandbox": "read-only", "cwd": self.proj},
+                                                  "tool_response": json.dumps({"threadId": "t1", "content": "ok"})}))
+        self.assertIsNone(self._mcp("mcp__codex__codex-reply", threadId="t1"))      # 续聊不算新派活，沿用只读档
+        self.assertIn("Codex 派活 1 次", self.hook("stop", {})["systemMessage"])
+        c = dp.load_state("s1", self.proj)["codex"]
+        self.assertEqual((c["runs"], c["read_runs"], c["files"], c.get("replies")), (1, 1, 0, 1))
+
+    def test_mcp_write_changes_not_blamed_on_claude(self):
+        self.proj_cfg({"level": 3})
+        self.hook("session-start", {})
+        with open(os.path.join(self.proj, "by_codex.go"), "w") as f:      # Codex 在 MCP 里写的
+            f.write("package x\n")
+        self._mcp(sandbox="workspace-write", cwd=self.proj)
+        self.assertIsNone(self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {}}))
+        msg = self.hook("stop", {})["systemMessage"]
+        self.assertIn("Codex 派活 1 次", msg)
+        self.assertNotIn("命令行改", msg)
+
+    def test_mcp_write_into_other_repo_counts_for_session(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        with open(os.path.join(self.other, "n.go"), "w") as f:
+            f.write("package n\n")
+        self._mcp(sandbox="workspace-write", cwd=self.other)
+        self.assertIsNone(self.hook("post-tool", {"cwd": self.other, "tool_name": "Bash",
+                                                  "tool_input": {"command": "ls"}, "tool_response": {}}))
+        self.assertIn("Codex 派活 1 次", self.hook("stop", {})["systemMessage"])
+
+    def test_readonly_mcp_does_not_swallow_claude_shell_edit(self):
+        # 档位 3：Claude 的命令行改动与只读 MCP 并行，MCP 的钩子先跑——改动仍要在命令的钩子里报出来
+        self.proj_cfg({"level": 3})
+        self.hook("session-start", {})
+        with open(os.path.join(self.proj, "claude_did.go"), "w") as f:
+            f.write("package x\n")
+        self._mcp(sandbox="read-only", cwd=self.proj)
+        out = self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": "echo > claude_did.go"}, "tool_response": {}})
+        self.assertIn("违规", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_reply_refreshes_thread_repo_not_cwd(self):
+        # 会话起于 proj；codex(cwd=other) 开线程，续聊（不带 cwd、顶层 cwd=proj）改了 other ⇒ 不能算 Claude 的
+        os.makedirs(os.path.join(self.other, ".claude"))
+        with open(os.path.join(self.other, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+            json.dump({"level": 3}, f)
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.hook("post-tool", {"tool_name": "mcp__codex__codex", "tool_input": {"prompt": "x", "sandbox": "workspace-write", "cwd": self.other},
+                                "tool_response": json.dumps({"threadId": "T1", "content": "ok"})})
+        with open(os.path.join(self.other, "by_reply.go"), "w") as f:
+            f.write("package o\n")
+        self._mcp("mcp__codex__codex-reply", threadId="T1")
+        out = self.hook("post-tool", {"cwd": self.other, "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {}})
+        self.assertIsNone(out)
+
+    def test_plugin_style_codex_server_name(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dispatch_hook", HOOK)
+        h = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(h)
+        for t in ("mcp__codex__codex", "mcp__codex__codex-reply", "mcp__plugin_openai_codex__codex"):
+            self.assertTrue(h._CODEX_MCP.match(t), t)
+        self.assertFalse(h._CODEX_MCP.match("mcp__codex__other_tool"))
+        self.assertEqual(h._thread_id('{"threadId":"abc","content":"x"}'), "abc")
+        with open(os.path.join(REPO, "docs", "settings-hooks.json"), encoding="utf-8") as f:
+            import re
+            m = json.load(f)["hooks"]["PostToolUse"][0]["matcher"]
+        for t in ("mcp__codex__codex", "mcp__plugin_openai_codex__codex-reply", "Bash"):
+            self.assertTrue(re.fullmatch(m, t), (m, t))
+
     def test_codex_run_without_env_falls_back_to_project_lookup(self):
         self.proj_cfg({"level": 1})
         self.hook("session-start", {})

@@ -223,18 +223,108 @@ def _is_analysis_file(path, r):
     return re.search(r"(^|/)(scratch|scratchpad|tmp|temp)/", where, re.I) is not None
 
 
+# 走 codex MCP 派的活：codex = 开新线程（一次派活），codex-reply = 同一线程续聊
+_CODEX_MCP = re.compile(r"^mcp__.*codex.*__codex(-reply)?$")
+
+
+def _thread_of(inp, sid):
+    """续聊对应的线程记录（开线程时记下的仓库与档）。只读、不加锁：线程记录写入后不再改。"""
+    tin = inp.get("tool_input") or {}
+    tid = tin.get("threadId") or tin.get("conversationId")
+    data, _ = dp._load_json(dp._session_path(sid))
+    return ((data or {}).get("codex_threads") or {}).get(tid) if tid else None
+
+
+def _codex_mcp_root(inp, sid, reply=False):
+    """Codex 在哪个仓库干活：续聊 → 开线程时记下的仓库（codex-reply 不带 cwd）；
+    否则 tool_input.cwd 所在 git 仓库；都没有 → 按命令的规则定。"""
+    if reply:
+        th = _thread_of(inp, sid)
+        if th and th.get("root"):
+            return th["root"]
+    cwd = (inp.get("tool_input") or {}).get("cwd")
+    if isinstance(cwd, str) and cwd:
+        base = cwd if os.path.isabs(cwd) else os.path.join(inp.get("cwd") or os.getcwd(), cwd)
+        g = dp.git_root(base)
+        if g:
+            return g
+    return _pick_root(inp, sid)
+
+
 def on_post_tool(inp):
-    tool = inp.get("tool_name")
-    if tool not in EDIT_TOOLS + ("Bash", "PowerShell"):
+    tool = inp.get("tool_name") or ""
+    mcp = _CODEX_MCP.match(tool)
+    if tool not in EDIT_TOOLS + ("Bash", "PowerShell") and not mcp:
         return
     sid = inp.get("session_id")
     tin = inp.get("tool_input") or {}
     path = (tin.get("file_path") or tin.get("notebook_path")) if tool in EDIT_TOOLS else None
-    r = dp.resolve(inp.get("cwd"), sid, bind=True, root=_pick_root(inp, sid, path))
+    root = _codex_mcp_root(inp, sid, reply=bool(mcp.group(1))) if mcp else _pick_root(inp, sid, path)
+    r = dp.resolve(inp.get("cwd"), sid, bind=True, root=root)
+    if mcp:
+        with dp.session(sid, r["root"]) as st:
+            _codex_mcp_update(st, r, inp, reply=bool(mcp.group(1)))
+        return
     with dp.session(sid, r["root"]) as st:
         notes = _post_tool_update(st, r, sid, tool, inp)
     if notes:
         _out(_ctx("PostToolUse", "\n".join(notes)))
+
+
+def _thread_id(resp):
+    """codex 返回里的 threadId。实测 tool_response 是 JSON 字符串 {"threadId": ..., "content": ...}；也兼容已解析的 dict。"""
+    if isinstance(resp, str):
+        try:
+            resp = json.loads(resp)
+        except ValueError:
+            m = re.search(r'"threadId"\s*:\s*"([^"]+)"', resp)
+            return m.group(1) if m else None
+    if isinstance(resp, dict):
+        tid = resp.get("threadId") or (resp.get("structuredContent") or {}).get("threadId")
+        return tid if isinstance(tid, str) else None
+    return None
+
+
+def _codex_mcp_update(st, r, inp, reply):
+    """MCP 派活记账。Codex 在 MCP 里改的文件不经 Claude 的工具：不在这里吸收进快照的话，Claude 的下一条命令
+    做快照对比时会把它们算成 Claude 命令行改的（档位 3 还会记违规）。
+    只读档不碰快照：它改不了文件，这期间冒出来的变化是 Claude（并行的命令、cwd 外仓库里的命令）或外部改的，
+    留给下一条命令去发现（10-26 两轮审查；实测过只读调用把之前 cp 进临时克隆的文件吸收掉）。
+    写模式照样可能吞掉并行命令的改动、文件数可能偏多——已知局限。行数不算：MCP 不要求工作树干净，
+    相对 HEAD 的 diff 会混进之前就有的改动。"""
+    tin = inp.get("tool_input") or {}
+    c = st["codex"]
+    threads = st.setdefault("codex_threads", {})
+    if reply:
+        tid = tin.get("threadId") or tin.get("conversationId")
+        th = threads.get(tid) or {}
+        mode = "reply"
+        sandbox_mode = th.get("mode", "unknown")          # 续聊沿用开线程时的档；不认识的线程按可写处理
+        c["replies"] = c.get("replies", 0) + 1
+    else:
+        mode = sandbox_mode = "read" if tin.get("sandbox") == "read-only" else ("write" if tin.get("sandbox") else "unknown")
+        c["runs"] += 1
+        c["read_runs" if mode == "read" else "write_runs"] += 1
+        tid = _thread_id(inp.get("tool_response"))
+        if tid:
+            threads[tid] = {"root": r["root"], "mode": mode, "time": time.time()}
+    changed = 0
+    if sandbox_mode != "read":
+        homes = [r]
+        if st.get("project") and dp.norm(st["project"]) != dp.norm(r["root"]):
+            homes.append(dp.resolve(inp.get("cwd"), inp.get("session_id"), root=st["project"]))
+        for rr in homes:
+            snaps = _snapshots(st)
+            cur = dp.dirty_sources(rr)
+            if cur is None:
+                continue
+            prev = snaps.get(dp.norm(rr["root"]))
+            if isinstance(prev, dict):
+                changed += sum(1 for k, m in cur.items() if prev.get(k) != m)
+            snaps[dp.norm(rr["root"])] = cur
+    c["files"] += changed
+    dp.append_stats({"time": time.time(), "kind": "codex_run", "via": "mcp", "project": r["root"], "mode": mode,
+                     "added": 0, "removed": 0, "files": changed, "session_id": inp.get("session_id")})
 
 
 def _shell_changes(st, r, resp, is_dispatch, notes):
