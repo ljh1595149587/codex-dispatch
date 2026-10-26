@@ -50,7 +50,12 @@ param(
     [int]$Budget = 0,
 
     # 续接已有线程而非新开
-    [string]$ResumeThread = ''
+    [string]$ResumeThread = '',
+
+    # 写模式的受保护路径（逗号分隔的 glob，相对项目根，如 "tests/acceptance/*"）。
+    # 验收测试由非实现方写好，Codex 为了让测试通过去改测试本身 = 不合格，脚本直接判退出码 3。
+    [Parameter(ParameterSetName = 'Task')]
+    [string]$Protect = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,7 +91,9 @@ $sandbox = if ($Mode -eq 'read') { 'read-only' } else { 'workspace-write' }
 
 # 开写权限前必须有干净的回滚点 —— 不采信「它不会乱改」，只信 git。
 if ($PSCmdlet.ParameterSetName -eq 'Task' -and $Mode -eq 'write') {
-    $dirty = git -C $root status --porcelain
+    # 派活日志例外：登记「派给 Codex」时 dispatch_policy.py 刚往里追加过一条，
+    # 它不是任何一方的代码改动，也被排除在 Codex 改动统计之外。
+    $dirty = git -C $root status --porcelain --untracked-files=all | Where-Object { $_ -notmatch 'docs/dispatch-log\.md$' }
     if ($dirty) {
         Write-Host "工作树不干净，先提交或 stash 再开写权限：" -ForegroundColor Red
         Write-Host $dirty
@@ -285,6 +292,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
     Write-Host "第 2 轮 $r2" -ForegroundColor Green
     Write-Host "两份对照读：只采信第 2 轮判成立的。" -ForegroundColor DarkGray
     Write-Host "原始事件流：$raw"
+    & $py (Join-Path $PSScriptRoot 'dispatch_policy.py') --cwd $root record-codex --mode read | Out-Null
     exit $code
 }
 
@@ -293,9 +301,23 @@ Remove-Item $raw -ErrorAction SilentlyContinue
 Write-Host "档位 $sandbox | 目录 $target" -ForegroundColor Cyan
 $code = Invoke-Codex -Sandbox $sandbox -Prompt $Prompt -OutFile $last -Thread $ResumeThread
 
+$policy = Join-Path $PSScriptRoot 'dispatch_policy.py'
 if ($Mode -eq 'write') {
     Write-Host "`n=== 改动（自行逐行验收，不采信它的完成报告）===" -ForegroundColor Yellow
     git -C $root --no-pager diff --stat
+    # 计入本会话的「Codex 改了多少行」统计（会话结束汇总里和 Claude 的改动对照）
+    & $py $policy record-codex-from-git --root $root | Out-Host
+    if ($Protect) {
+        $bad = & $py $policy check-protected --root $root --globs $Protect
+        if ($LASTEXITCODE -eq 1) {
+            Write-Host "`n不合格：改了受保护路径（$Protect）：" -ForegroundColor Red
+            $bad | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+            Write-Host "验收测试由非实现方编写，Codex 不得修改。回滚后重派，并在需求里写明不许动这些文件。" -ForegroundColor Yellow
+            exit 3
+        }
+    }
+} else {
+    & $py $policy --cwd $root record-codex --mode read | Out-Null
 }
 
 if (Test-Path $last) {

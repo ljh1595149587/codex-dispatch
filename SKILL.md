@@ -1,6 +1,6 @@
 ---
 name: codex-dispatch
-description: 把任务外包给 Codex 执行（只读探索、批量机械活、两轮代码审查），Claude 负责派活与验收，用户不和 Codex 打交道。当用户说"派给 codex""让 codex 看看""codex 审查""外包给 codex""用 codex 跑"时使用。**更要在没人开口时主动自查** —— 命中以下任一条就停下来问「这批能不能一次派清」：准备写第 2 个分析脚本（查日志/查库/统计分布）、连续读第 2 个大文件或整份日志、要补一整套测试、要对同一批数据做第 2 轮口径不同的统计。触发词：codex、派活、外包、两轮审查、codex review、独立复核
+description: 把任务外包给 Codex 执行（只读探索、批量机械活、实现、两轮代码审查），Claude 负责派活与验收，用户不和 Codex 打交道。按项目「派活档位」（0 关 / 1 轻 / 2 中 / 3 重）和「Claude 额度」（宽裕 / 紧）决定谁实现、谁验收；全局钩子在每次会话显示生效档位、到阈值时要求登记派或不派、档位 3 拦截 Claude 直接改源码。当用户说"派给 codex""让 codex 看看""codex 审查""外包给 codex""用 codex 跑"时使用。**更要在没人开口时主动自查** —— 命中以下任一条就停下来问「这批能不能一次派清」：准备写第 2 个分析脚本（查日志/查库/统计分布）、连续读第 2 个大文件或整份日志、要补一整套测试、要对同一批数据做第 2 轮口径不同的统计。触发词：codex、派活、外包、两轮审查、codex review、独立复核
 user-invocable: true
 allowed-tools: "Bash, Read, Edit, Write, Grep, Glob, PowerShell"
 ---
@@ -16,7 +16,35 @@ $D = (Get-ChildItem "$env:USERPROFILE\.claude\skills\*\bin\dispatch-codex.ps1").
 $S = Split-Path (Split-Path $D -Parent) -Parent
 ```
 
-**这是全仓唯一允许写出 skill 路径的地方**，其余一律从 `$S` / `$D` 派生。
+**这是全仓唯一允许写出 skill 路径的地方**，其余一律从 `$S` / `$D` 派生
+（档位命令：`$P = Join-Path $S 'bin\dispatch_policy.py'`，用 `python $P ...` 调）。
+
+## 档位与额度（规则全文：`$S\docs\levels.md`）
+
+每次会话开始，全局钩子会注入一行 `派活档位：… → 生效 N`。**按生效档位行事，不按印象。**
+
+| 生效档位 | 实现默认谁做 | 钩子强制 |
+|---|---|---|
+| 0 关 | Claude；用户要求才派 | 无 |
+| 1 轻 | Claude；排查/统计先想能否派 | 第 2 个分析脚本起提醒 |
+| 2 中 | 需求清楚、有测试能判对错的派 Codex；设计/模糊/核心逻辑自己做 | 改源码累计 3 文件或 80 行要求登记 |
+| 3 重 | Codex；Claude 只写需求、验收标准和测试 | Claude 改源码被拦，先登记才能小修 |
+
+- Claude 额度 `tight` 时生效档位 = max(项目档位+1, 2)，并改用「省 Claude 上下文」：排查一律派只读档、只读精简报告和命令输出
+- **登记决定**（钩子要求时必做，也写进项目 `docs/dispatch-log.md`）：
+  `python $P decide dispatch --reason "..."` 或 `python $P decide self --reason "..." [--files a.go,b.go]`
+- 用户说「这次按 N 档」：`python $P override --level N`（只对本会话有效）；查看：`python $P status`
+- 配置：用户级 `~/.claude/codex-dispatch.json`（`claude_budget`、`default_level`）；项目级 `.claude/codex-dispatch.json`（`level`）。
+  `python $P init-user --budget ample` / `python $P set-project-level 2`
+
+## 验收分工（实现者不能是唯一验收者）
+
+- **Codex 实现 → Claude 验收**：动手前 Claude 按需求写验收测试，派活时用 `-Protect "tests/acceptance/*"` 保护它们
+  （Codex 改了受保护路径脚本直接退出码 3）；只看 `git diff` 和自己跑的命令输出
+- **Claude 实现 → Codex 验收**：`-Review` 两轮审查，并在说明里附针对性清单（如「列出 X 的所有调用点逐个确认」）。
+  **驳回 Codex 的发现必须给证据**（测试或 file:line），驳回条目记进派活日志
+- 风险定验收深度，与档位无关：高风险（迁移、计费、鉴权、并发、部署）四层全做
+- task_plan.md 每个阶段的「执行者 / 验收者 / 风险 / 验收证据」由 planning-with-files-zh 的模板提供，照填
 自检 [6] 会拦住按目录名硬编码的路径 —— 理由见 README「改名清单」。
 
 ## 第一原则：用户不和 Codex 打交道

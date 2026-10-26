@@ -181,5 +181,20 @@ try {
     Remove-Item $guardTmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "`n[8] 档位与钩子（tests\test_policy.py）" -ForegroundColor Cyan
+# 档位、额度、拦截、提醒、统计全由钩子在每次工具调用时执行，坏了不会报错，
+# 只会静默地「不提醒」「不拦截」—— 正是这套机制要防的那种失效，所以必须机器判定。
+$py = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $py) {
+    Check "找到 python" $false
+} else {
+    # unittest 把结果写到 stderr。不能在 PS 层 2>&1（PS 5.1 会包成 NativeCommandError，
+    # 配 $ErrorActionPreference='Stop' 直接终止脚本，见 README 环境事实表），在 cmd 层合流。
+    $tdir = Join-Path $repo 'tests'
+    $out = & cmd.exe /c "`"$py`" -m unittest discover -s `"$tdir`" -p test_*.py 2>&1" | Out-String
+    $ran = if ($out -match 'Ran (\d+) test') { $Matches[1] } else { '?' }
+    Check "单测全过（$ran 条）" ($LASTEXITCODE -eq 0) ($out.Trim() -split "`n" | Select-Object -Last 12 | Out-String)
+}
+
 Write-Host "`n通过 $pass，失败 $fail`n" -ForegroundColor $(if ($fail) { 'Red' } else { 'Green' })
 exit $(if ($fail) { 1 } else { 0 })

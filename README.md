@@ -45,6 +45,25 @@ codex_review_attack.md
 .codex-prompt.txt
 ```
 
+## 派活档位、Claude 额度与钩子
+
+规则全文和设计理由见 `docs/levels.md`。一句话：**skill 讲怎么做，钩子和派活脚本管必须做，统计让偏离看得见。**
+（起因：2026-09-01 之后所有项目派活日志零记录，开发实现一次没派过 —— 判据没错，是判断压根没发生。）
+
+| 文件 | 作用 |
+|---|---|
+| `bin/dispatch_policy.py` | 配置解析、生效档位、会话状态；CLI：`status` / `decide` / `override` / `init-user` / `set-project-level` 等 |
+| `hooks/dispatch_hook.py` | 全局钩子入口（SessionStart / PreToolUse / PostToolUse / Stop / SessionEnd），异常一律放行 |
+| `tests/test_policy.py` | 离线单测，自检 [8] 会跑 |
+
+状态落在 `~/.claude/codex-dispatch-state/`（会话状态留 7 天、`stats.jsonl` 汇总、`errors.log` 钩子异常）。
+调试钩子输入：用户级配置加 `"debug": true` 或设环境变量 `CODEX_DISPATCH_HOOK_DEBUG=1`，原始输入（截断）写进 `debug.jsonl`。
+
+钩子必须写在 `~/.claude/settings.json`（skill frontmatter 里的钩子只在该 skill 被调用过的会话生效，管不住「没想起来」）。接线见 `docs/settings-hooks.json`，两条硬约束：
+
+- **按文件名 glob 找 `hooks/dispatch_hook.py`**，不写目录名 —— 改名、搬家都不用动 settings.json（同 SKILL.md 顶部的发现方式）
+- **文件找不到时必须放行**：python 打不开脚本的退出码是 2，而 PreToolUse 钩子**退出码 2 = 拦截这次工具调用**。不加判断的话，文件一丢所有编辑都会被拦。命令里先判断存在、末尾 `|| true`；有意的拦截走 stdout JSON + 退出码 0，不受影响
+
 ## 三档 sandbox
 
 | 档位 | 参数 | 用途 |
@@ -132,7 +151,7 @@ powershell -NoProfile -File tests\selfcheck.ps1
 这个 skill 迟早要改名 —— 一旦接入第二个后端（Gemini 等），`codex-dispatch`
 就和内容自相矛盾了。`name` / `description` 不是标签，是**检索键**：找不到就等于没有。
 
-**改名时只需要动这四处**（自检 [6] 保证不会有第五处）：
+**改名时只需要动这四处**（自检 [6] 保证不会有第五处；settings.json 的钩子命令按文件名 glob，也不受影响）：
 
 1. `SKILL.md` 的 `name:` 字段 —— 必须与目录名一致
 2. `README.md` 的标题

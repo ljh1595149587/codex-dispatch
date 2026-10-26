@@ -1,0 +1,66 @@
+{
+  "_说明": [
+    "把 hooks 整段合并进 ~/.claude/settings.json 的 hooks（已有同事件的条目保留，数组追加）。",
+    "命令按文件名 glob 找 dispatch_hook.py：不写 skill 目录名，改名搬家不用改这里。",
+    "找不到脚本时 [ -n \"$f\" ] 为假 + || true ⇒ 放行。不能省：python 打不开脚本退出码是 2，PreToolUse 钩子退出码 2 = 拦截工具调用。"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(ls ~/.claude/skills/*/hooks/dispatch_hook.py 2>/dev/null | head -1); [ -n \"$f\" ] && python \"$f\" session-start || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(ls ~/.claude/skills/*/hooks/dispatch_hook.py 2>/dev/null | head -1); [ -n \"$f\" ] && python \"$f\" pre-tool || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(ls ~/.claude/skills/*/hooks/dispatch_hook.py 2>/dev/null | head -1); [ -n \"$f\" ] && python \"$f\" post-tool || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(ls ~/.claude/skills/*/hooks/dispatch_hook.py 2>/dev/null | head -1); [ -n \"$f\" ] && python \"$f\" stop || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(ls ~/.claude/skills/*/hooks/dispatch_hook.py 2>/dev/null | head -1); [ -n \"$f\" ] && python \"$f\" session-end || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
