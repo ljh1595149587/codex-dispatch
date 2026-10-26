@@ -586,11 +586,12 @@ class TestCwdDrift(Env):
         with open(os.path.join(self.other, "o.go"), "w") as f:
             f.write("package o\n")
         self.hook("session-start", {})
-        bash = lambda cwd: self.hook("post-tool", {"cwd": cwd, "tool_name": "Bash",  # noqa: E731
-                                                   "tool_input": {"command": "ls"}, "tool_response": {}})
-        self.assertIsNone(bash(self.other))
-        self.assertIsNone(bash(self.proj))
-        self.assertIsNone(bash(self.other))
+        def bash(cwd):   # 进 other 时会有一句「进入仓库」的档位说明；要的是不报违规
+            out = self.hook("post-tool", {"cwd": cwd, "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {}})
+            return (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+        self.assertNotIn("违规", bash(self.other))
+        self.assertNotIn("违规", bash(self.proj))
+        self.assertNotIn("违规", bash(self.other))
 
     def test_shell_edit_of_session_project_seen_from_plain_cwd(self):
         self.proj_cfg({"level": 3})
@@ -773,6 +774,110 @@ class TestCwdDrift(Env):
             m = json.load(f)["hooks"]["PostToolUse"][0]["matcher"]
         for t in ("mcp__codex__codex", "mcp__plugin_openai_codex__codex-reply", "Bash"):
             self.assertTrue(re.fullmatch(m, t), (m, t))
+
+    def _bash_ctx(self, cwd=None):
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {}}
+        if cwd:
+            payload["cwd"] = cwd
+        out = self.hook("post-tool", payload)
+        return (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+
+    def test_level_change_mid_session_is_told_once(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.assertEqual(self._bash_ctx(), "")
+        self.proj_cfg({"level": 2})                              # 用户中途手改配置
+        ctx = self._bash_ctx()
+        self.assertIn("档位已变", ctx)
+        self.assertIn("生效 2", ctx)
+        self.assertIn("必须登记", ctx)                           # 带上新档的规则
+        self.assertEqual(self._bash_ctx(), "")                   # 只说一次
+
+    def test_override_mid_session_is_told(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.assertEqual(self.policy("--session", "s1", "override", "--level", "3")[0], 0)
+        self.assertIn("生效 3", self._bash_ctx())
+
+    def test_entering_repo_with_other_level_is_told_same_level_silent(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.assertEqual(self._bash_ctx(self.other), "")          # other 无配置 = 用户默认 1，同档不打扰
+        os.makedirs(os.path.join(self.other, ".claude"))
+        with open(os.path.join(self.other, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+            json.dump({"level": 2}, f)
+        self.assertIn("生效 2", self._bash_ctx(self.other))
+        plain_repo = os.path.join(self.tmp, "third")
+        os.makedirs(os.path.join(plain_repo, ".claude"))
+        subprocess.run(["git", "init", "-q", plain_repo], check=True)
+        with open(os.path.join(plain_repo, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+            json.dump({"level": 0}, f)
+        self.assertIn("进入仓库", self._bash_ctx(plain_repo))
+
+    def test_foreign_repo_note_commands_target_that_repo(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        os.makedirs(os.path.join(self.other, ".claude"))
+        with open(os.path.join(self.other, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+            json.dump({"level": 2}, f)
+        ctx = self._bash_ctx(self.other)
+        self.assertIn('--cwd "%s"' % self.other.replace("\\", "/"), ctx)
+
+    def test_deny_counts_as_told_so_downgrade_is_told(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.proj_cfg({"level": 3})
+        deny = self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.proj, "a.go")}})
+        self.assertEqual(deny["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.proj_cfg({"level": 1})                               # 被拒之后又改回 1
+        ctx = self._bash_ctx()
+        self.assertIn("档位已变", ctx)
+        self.assertIn("生效 1", ctx)
+
+    def test_home_level_change_told_while_cwd_in_other_repo(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.assertEqual(self._bash_ctx(self.other), "")
+        self.proj_cfg({"level": 2})
+        ctx = self._bash_ctx(self.other)
+        self.assertIn("生效 2", ctx)
+        self.assertIn(self.proj, ctx)
+
+    def test_head_symlink_to_unborn_branch_is_a_repo(self):
+        repo = os.path.join(self.tmp, "symhead")
+        os.makedirs(os.path.join(repo, ".git"))
+        try:
+            os.symlink(os.path.join(repo, ".git", "refs", "heads", "main"), os.path.join(repo, ".git", "HEAD"))
+        except (OSError, NotImplementedError):
+            self.skipTest("没有建符号链接的权限")
+        self.assertEqual(dp.norm(dp.git_root(repo)), dp.norm(repo))
+
+    def test_head_dangling_symlink_mocked(self):
+        # Windows 默认建不了符号链接：模拟「HEAD 是悬空链接」——isfile 为 False、islink 为 True
+        from unittest import mock
+        repo = os.path.join(self.tmp, "symhead2")
+        os.makedirs(os.path.join(repo, ".git"))
+        head = os.path.join(repo, ".git", "HEAD")
+        real_islink = os.path.islink
+        with mock.patch.object(dp.os.path, "islink", side_effect=lambda p: p == head or real_islink(p)):
+            self.assertTrue(dp.has_git(repo))
+        self.assertFalse(dp.has_git(repo))                     # 不模拟时：既不是文件也不是链接
+
+    def test_broken_git_dir_is_not_a_repo(self):
+        # D:\work\.git 只剩 info/ 的残留目录：git 不认，钩子也不能认
+        outer = os.path.join(self.tmp, "outer")
+        os.makedirs(os.path.join(outer, ".git", "info"))
+        inner = os.path.join(outer, "proj2")
+        os.makedirs(inner)
+        self.assertIsNone(dp.git_root(inner))
+        with open(os.path.join(outer, ".git", "HEAD"), "w") as f:
+            f.write("ref: refs/heads/master\n")
+        self.assertEqual(dp.norm(dp.git_root(inner)), dp.norm(outer))
+        wt = os.path.join(self.tmp, "wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".git"), "w") as f:       # worktree / 子模块：.git 是文件
+            f.write("gitdir: ../somewhere\n")
+        self.assertEqual(dp.norm(dp.git_root(wt)), dp.norm(wt))
 
     def test_codex_run_without_env_falls_back_to_project_lookup(self):
         self.proj_cfg({"level": 1})

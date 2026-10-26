@@ -43,13 +43,16 @@ def _ctx(event, text):
     return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
 
 
-def _cmd(sub, sid=None):
-    """给 Claude 的命令。带上本会话 ID：同一项目开着两个会话时，登记不会记到另一个会话上。"""
+def _cmd(sub, sid=None, root=None):
+    """给 Claude 的命令。带上本会话 ID：同一项目开着两个会话时，登记不会记到另一个会话上。
+    带上项目根：Claude 在 A 里执行针对仓库 B 的提示时，override / 豁免要落到 B，不能按命令的 cwd 落到 A。"""
     sess = ' --session "%s"' % sid if sid else ""
-    return 'python "%s"%s %s' % (POLICY.replace("\\", "/"), sess, sub)
+    where = ' --cwd "%s"' % root.replace("\\", "/") if root else ""
+    return 'python "%s"%s%s %s' % (POLICY.replace("\\", "/"), sess, where, sub)
 
 
-def _rules(eff, budget, sid=None):
+def _rules(eff, budget, sid=None, root=None):
+    cmd = lambda sub: _cmd(sub, sid, root)  # noqa: E731
     lines = []
     if eff == 0:
         lines.append("档位 0：不主动派活；用户明确要求时才派。")
@@ -58,15 +61,15 @@ def _rules(eff, budget, sid=None):
     if eff >= 2:
         lines.append("需求写得清、有测试能判对错的实现派给 Codex（codex-dispatch skill）；设计、模糊需求、核心逻辑自己做。"
                      "规划时 task_plan 每个阶段填 执行者 / 验收者 / 风险。Claude 改源码累计到阈值时必须登记："
-                     + _cmd('decide dispatch|self --reason "..."', sid))
+                     + cmd('decide dispatch|self --reason "..."'))
     if eff >= 3:
-        lines.append("档位 3：Claude 直接改项目源码会被拦截。确需自己小修，先登记：" + _cmd('decide self --reason "..." --files a,b', sid)
+        lines.append("档位 3：Claude 直接改项目源码会被拦截。确需自己小修，先登记：" + cmd('decide self --reason "..." --files a,b')
                      + "（豁免 30 分钟）。")
     if budget == "tight":
         lines.append("Claude 额度紧：排查/读日志/统计一律派 Codex 只读档、报告 ≤4KB；改→测→修循环归 Codex；验收只看统计、关键片段和命令输出，深度审查走两轮审查。")
     if eff >= 1:
         lines.append("验收：实现者不能是唯一验收者；风险高（迁移/计费/鉴权/并发/部署）四层验收全做。用户说「这次按 N 档」时执行 "
-                     + _cmd("override --level N", sid) + "。")
+                     + cmd("override --level N") + "。")
     return "\n".join("- " + x for x in lines)
 
 
@@ -117,6 +120,24 @@ def _snapshots(st):
     return snaps
 
 
+def _level_note(st, r, sid):
+    """Claude 知道的档位来自会话开始时注入的那段规则；中途改了配置 / 用了 override / 转去档位不同的仓库，
+    钩子照新档执行，Claude 却不知道 ⇒ 生效档位和上次告诉 Claude 的不一样时补一句，带上新档的规则。"""
+    seen = st.setdefault("levels_told", {})
+    key = dp.norm(r["root"])
+    if seen.get(key) == r["effective"]:
+        return None
+    first = key not in seen
+    seen[key] = r["effective"]
+    home = dp.norm(st["project"]) if st.get("project") else None
+    if first and home == key:
+        return None      # 起始项目没记过 = 旧版状态；会话开始时已经告诉过了
+    if first and home in seen and seen[home] == r["effective"]:
+        return None      # 新进的仓库和起始项目同档：Claude 手上的规则照样适用，不打扰
+    head = "进入仓库 %s" % r["root"] if first else "档位已变（%s）" % r["root"]
+    return "[codex-dispatch] %s：%s\n%s" % (head, dp.summary_line(r), _rules(r["effective"], r["budget"], sid, r["root"]))
+
+
 def _acct_key(st, root, rel):
     """记账用的文件键。会话起始项目内是相对路径；别的仓库用「//仓库根/相对路径」——
     相对路径不会以 / 开头，两类键不会撞（只带仓库名会撞：起始项目的 b/x.go 与仓库 b 的 x.go）。"""
@@ -134,8 +155,9 @@ def on_session_start(inp):
         snaps = _snapshots(st)
         if r["effective"] >= 1 and dp.norm(r["root"]) not in snaps:
             snaps[dp.norm(r["root"])] = dp.dirty_sources(r)   # 基线：会话开始前已有的改动不算 Claude 的
+        st.setdefault("levels_told", {})[dp.norm(r["root"])] = r["effective"]   # 下面这段规则就是告诉 Claude 的档位
     line = dp.summary_line(r)
-    text = "[codex-dispatch] %s\n项目根：%s\n%s" % (line, r["root"], _rules(r["effective"], r["budget"], sid))
+    text = "[codex-dispatch] %s\n项目根：%s\n%s" % (line, r["root"], _rules(r["effective"], r["budget"], sid, r["root"]))
     out = _ctx("SessionStart", text)
     out["systemMessage"] = line
     _out(out)
@@ -157,6 +179,8 @@ def on_pre_tool(inp):
         if dp.active_waiver(st, path):
             return
         st["violations"].append({"time": time.time(), "kind": "blocked_edit", "file": path})
+        # 拒绝理由就是在告诉 Claude「这里是档位 3」；被拒的调用不触发 PostToolUse，不在这记下，降档时会漏提醒
+        st.setdefault("levels_told", {})[dp.norm(r["root"])] = r["effective"]
     # 豁免按会话起始项目解析相对路径：文件在别的仓库时给绝对路径，否则登记了也放不行、还会误放起始项目的同名文件
     home = st.get("project")
     if home and dp.norm(home) != dp.norm(r["root"]):
@@ -165,7 +189,7 @@ def on_pre_tool(inp):
         wf = dp.rel_in_root(path, r["root"]) or os.path.basename(path)
     reason = ("[codex-dispatch] 生效档位 3：项目源码由 Codex 实现，Claude 不直接改。"
               "请把这项改动写成需求派给 Codex（codex-dispatch skill，写模式）。"
-              "确属必须自己做的小修，先登记理由再改：" + _cmd('decide self --reason "..." --files ' + wf, sid))
+              "确属必须自己做的小修，先登记理由再改：" + _cmd('decide self --reason "..." --files ' + wf, sid, r["root"]))
     _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                  "permissionDecisionReason": reason}})
 
@@ -261,12 +285,15 @@ def on_post_tool(inp):
     path = (tin.get("file_path") or tin.get("notebook_path")) if tool in EDIT_TOOLS else None
     root = _codex_mcp_root(inp, sid, reply=bool(mcp.group(1))) if mcp else _pick_root(inp, sid, path)
     r = dp.resolve(inp.get("cwd"), sid, bind=True, root=root)
-    if mcp:
-        with dp.session(sid, r["root"]) as st:
-            _codex_mcp_update(st, r, inp, reply=bool(mcp.group(1)))
-        return
     with dp.session(sid, r["root"]) as st:
-        notes = _post_tool_update(st, r, sid, tool, inp)
+        if mcp:
+            _codex_mcp_update(st, r, inp, reply=bool(mcp.group(1)))
+            notes = []
+        else:
+            notes = _post_tool_update(st, r, sid, tool, inp)
+        lv = _level_note(st, r, sid)
+        if lv:
+            notes.insert(0, lv)
     if notes:
         _out(_ctx("PostToolUse", "\n".join(notes)))
 
@@ -399,7 +426,11 @@ def _post_tool_update(st, r, sid, tool, inp):
         # cwd 在别的仓库时，命令照样可能改到会话起始项目（cd 过去改、绝对路径改）
         home = st.get("project")
         if home and dp.norm(home) != dp.norm(r["root"]):
-            _shell_changes(st, dp.resolve(inp.get("cwd"), sid, root=home), resp, is_dispatch, notes)
+            rh = dp.resolve(inp.get("cwd"), sid, root=home)
+            lv = _level_note(st, rh, sid)          # 这一遍按起始项目的档执行，档变了也要告诉 Claude
+            if lv:
+                notes.append(lv)
+            _shell_changes(st, rh, resp, is_dispatch, notes)
 
     eff = r["effective"]
     if analysis:
@@ -407,7 +438,7 @@ def _post_tool_update(st, r, sid, tool, inp):
         if eff >= 1 and st["analysis_scripts"] >= st["analysis_next_remind"]:
             st["analysis_next_remind"] = st["analysis_scripts"] + dp.ANALYSIS_REMIND_EVERY
             notes.append("[codex-dispatch] 本会话已写第 %d 个分析脚本。停一下：剩下的排查/统计能不能一次写清派给 Codex 只读档？"
-                         "决定自己做也要登记：%s" % (st["analysis_scripts"], _cmd('decide self --reason "..."', sid)))
+                         "决定自己做也要登记：%s" % (st["analysis_scripts"], _cmd('decide self --reason "..."', sid, r["root"])))
 
     sd = st["since_decision"]
     if eff == 2 and (len(sd["files"]) >= dp.SRC_REMIND_FILES or sd["lines"] >= dp.SRC_REMIND_LINES) \
@@ -415,7 +446,7 @@ def _post_tool_update(st, r, sid, tool, inp):
         sd["reminded_at_files"] = len(sd["files"])
         notes.append("[codex-dispatch] 自上次登记以来 Claude 已改 %d 个源码文件、%d 行（档位 2）。"
                      "接下来的实现要不要派给 Codex？必须登记决定：%s"
-                     % (len(sd["files"]), sd["lines"], _cmd('decide dispatch|self --reason "..."', sid)))
+                     % (len(sd["files"]), sd["lines"], _cmd('decide dispatch|self --reason "..."', sid, r["root"])))
     return notes
 
 

@@ -82,11 +82,28 @@ def is_log(rel):
     return file_key(rel) == file_key(LOG_REL)
 
 
+def has_git(d):
+    """d 下的 .git 像不像真仓库：目录要有 HEAD，文件（worktree / 子模块）要以 gitdir: 开头。
+    只看「存在」不够：D:\\work\\.git 是个只剩 info/ 的残留空目录，git 自己不认，按存在判断会把
+    D:\\work 下所有没有自己 .git 的项目并成一个项目，命令行改动检测也跟着失效（10-26 实测）。"""
+    g = os.path.join(d, ".git")
+    if os.path.isdir(g):
+        head = os.path.join(g, "HEAD")      # HEAD 可以是指向未出生分支的符号链接：isfile 跟随后为 False，要单独认
+        return os.path.isfile(head) or os.path.islink(head)
+    if os.path.isfile(g):
+        try:
+            with open(g, encoding="utf-8", errors="replace") as f:
+                return f.read(200).lstrip().startswith("gitdir:")
+        except OSError:
+            return False
+    return False
+
+
 def git_root(p):
-    """p 所在 git 仓库的根（.git 是目录或文件都算）；不在任何仓库里返回 None。"""
+    """p 所在 git 仓库的根；不在任何仓库里返回 None。"""
     probe = os.path.abspath(p or os.getcwd())
     while True:
-        if os.path.exists(os.path.join(probe, ".git")):
+        if has_git(probe):
             return probe
         parent = os.path.dirname(probe)
         if parent == probe:
@@ -269,7 +286,7 @@ def dirty_sources(r):
     用来发现「不经编辑工具」改出来的源码：Claude Code 给 Bash 钩子的结果里没有改动文件列表（10-26 实测），
     只能前后对比。"""
     root = r["root"]
-    if not os.path.exists(os.path.join(root, ".git")):
+    if not has_git(root):
         return None
     try:
         out = subprocess.run(["git", "-C", root, "status", "--porcelain", "-z", "--untracked-files=all"],
