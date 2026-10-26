@@ -369,5 +369,76 @@ class TestReviewFindings(Env):
         self.assertEqual((added, n), (3, 1), files)
 
 
+class TestShellDetection(Env):
+    """命令行改文件：Claude Code 给 Bash 钩子的结果里没有改动文件列表（2026-10-26 实测），靠 git 快照前后对比。"""
+
+    def put(self, rel, text="x\n"):
+        full = os.path.join(self.proj, *rel.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+        return full
+
+    def bash(self, cmd, **extra):
+        tin = {"command": cmd}
+        tin.update(extra)
+        return self.hook("post-tool", {"tool_name": "Bash", "tool_input": tin, "tool_response": {"stdout": ""}})
+
+    def shell_files(self):
+        return dp.load_state("s1", self.proj)["claude"]["shell_files"]
+
+    def test_shell_edit_detected(self):
+        self.proj_cfg({"level": 1})
+        self.put("pre.go")                       # 会话开始前就有的改动不算
+        self.hook("session-start", {})
+        self.put("a.go")
+        self.bash("sed -i s/x/y/ a.go")
+        self.assertEqual(self.shell_files(), ["a.go"])
+
+    def test_edit_tool_change_not_double_counted(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        full = self.put("b.go")
+        self.hook("post-tool", {"tool_name": "Write", "tool_response": {},
+                                "tool_input": {"file_path": full, "content": "x\n"}})
+        self.bash("ls")
+        self.assertEqual(self.shell_files(), [])
+
+    def test_dispatch_command_not_attributed(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.put("c.go")
+        self.bash("powershell -File dispatch-codex.ps1 -Mode write -Prompt x")
+        self.bash("ls")
+        self.assertEqual(self.shell_files(), [])
+
+    def test_background_dispatch_suppresses_until_recorded(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.bash("powershell -File dispatch-codex.ps1 -Mode write -Prompt x", run_in_background=True)
+        self.put("by_codex.go")                  # Codex 在后台改的
+        self.bash("ls")
+        self.assertEqual(self.shell_files(), [])
+        self.policy("--session", "s1", "record-codex", "--mode", "read")   # 派活结束：清标记、刷新快照
+        self.put("by_claude.go")
+        self.bash("ls")
+        self.assertEqual(self.shell_files(), ["by_claude.go"])
+
+    def test_powershell_tool_counts_too(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.put("p.go")
+        self.hook("post-tool", {"tool_name": "PowerShell", "tool_input": {"command": "Set-Content p.go y"},
+                                "tool_response": {}})
+        self.assertEqual(self.shell_files(), ["p.go"])
+
+    def test_level3_shell_edit_flagged(self):
+        self.proj_cfg({"level": 3})
+        self.hook("session-start", {})
+        self.put("v.go")
+        out = self.bash("echo y > v.go")
+        self.assertIn("违规", out["hookSpecificOutput"]["additionalContext"])
+
+
 if __name__ == "__main__":
     unittest.main()

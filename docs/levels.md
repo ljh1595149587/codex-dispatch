@@ -70,7 +70,7 @@ skill 自带的 frontmatter 钩子只在该 skill 被调用过的会话生效，
 |---|---|
 | SessionStart | 注入一行生效档位与本档规则摘要；配置无效时说明原因 |
 | PreToolUse（Edit/Write/MultiEdit/NotebookEdit） | 档位 3：改项目源码 ⇒ 拒绝，除非已用 `policy.py decide self --reason ...` 登记（豁免 30 分钟或指定文件） |
-| PostToolUse（同上 + Bash） | 记 Claude 改动的文件与行数；Bash 用 Claude Code 给出的改动文件列表补「命令行改文件」的漏洞；识别分析脚本（内联 python/awk 长程序、在项目外写 .py/.sh）；按档位提醒 |
+| PostToolUse（同上 + Bash、PowerShell） | 记 Claude 改动的文件与行数；命令行改文件用 git 快照前后对比发现（见下）；识别分析脚本（内联 python/awk 长程序、在项目外写 .py/.sh）；按档位提醒 |
 | Stop | 本轮有改动或派活时，给用户一行统计（阶段字段的完整性由 planning 自己检查） |
 | SessionEnd | 会话汇总写入 `~/.claude/codex-dispatch-state/stats.jsonl`；清掉本会话的临时覆盖 |
 
@@ -78,7 +78,9 @@ skill 自带的 frontmatter 钩子只在该 skill 被调用过的会话生效，
 
 **「源码」**：项目根内、扩展名属于常见代码类型（可在项目配置里改），排除 docs、规划文件、`.claude`、`node_modules`、`dist` 等。
 
-**已知漏洞**：钩子看得到编辑工具，命令行写文件只能事后从改动文件列表发现（拦不住，只能记账 + 提醒）；统计行数对命令行改动只计文件数。所以档位 3 的「Claude 不碰源码」要靠拦截 + 事后统计一起看。
+**命令行改文件**：2026-10-26 实测，Claude Code 给 Bash 钩子的结果里**没有**改动文件列表（只有 stdout/stderr 等），在 git 仓库里 `sed -i` 也一样。所以改用 git 快照：会话开始记下有改动的源码文件及修改时间，每条命令后再取一次，不经编辑工具变化的就记为命令行改动。编辑工具改过的文件同步进快照（不重复计）；派活脚本那条命令不归因；后台派活期间（直到派活脚本统计完 Codex 改动）不归因，标记最长 2 小时。
+
+**已知漏洞**：命令行改动拦不住，只能事后记账 + 提醒（档位 3 记为违规）；行数只计文件数；`go generate` 这类生成命令产出的源码也会算作 Claude 的命令行改动（确属 Claude 触发，档位 3 下先登记再跑）。所以档位 3 的「Claude 不碰源码」要靠拦截 + 事后统计一起看。
 
 ## 6. 和 planning-with-files-zh 的对接
 

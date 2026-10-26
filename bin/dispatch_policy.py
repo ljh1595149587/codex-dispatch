@@ -254,6 +254,53 @@ def is_source(path, r):
     return os.path.splitext(parts[-1])[1].lower() in r["source_exts"]
 
 
+# ---------------------------------------------------------------- 命令行改动（git 快照）
+
+CODEX_RUNNING_MAX = 2 * 3600   # 后台派活标记的最长有效期：Codex 崩了没走到统计那步时自动失效
+
+
+def dirty_sources(r):
+    """项目里当前有改动的源码文件 {file_key(相对路径): mtime}（含未跟踪）。不是 git 仓库或 git 失败返回 None。
+
+    用来发现「不经编辑工具」改出来的源码：Claude Code 给 Bash 钩子的结果里没有改动文件列表（10-26 实测），
+    只能前后对比。"""
+    root = r["root"]
+    if not os.path.exists(os.path.join(root, ".git")):
+        return None
+    try:
+        out = subprocess.run(["git", "-C", root, "status", "--porcelain", "-z", "--untracked-files=all"],
+                             capture_output=True, timeout=5)
+    except Exception:  # noqa: BLE001
+        return None
+    if out.returncode != 0:
+        return None
+    toks = out.stdout.decode("utf-8", "replace").split("\0")
+    res = {}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if len(t) < 4:
+            continue
+        xy, path = t[:2], t[3:]
+        if xy[0] in "RC":        # 改名/复制：后面多一个原路径
+            i += 1
+        if "D" in xy:
+            continue
+        full = os.path.join(root, path)
+        if not is_source(full, r):
+            continue
+        try:
+            res[file_key(path)] = os.path.getmtime(full)
+        except OSError:
+            continue
+    return res
+
+
+def codex_running(st):
+    return time.time() < st.get("codex_running_until", 0)
+
+
 # ---------------------------------------------------------------- 行数统计
 
 def _lines(s):
@@ -592,6 +639,10 @@ def cmd_record_codex(a, added=0, removed=0, nfiles=0):
     root = project_root(a.cwd if getattr(a, "cwd", None) else a.root)
     sid = _cli_sid(a, root)
     with session(sid, root) as st:
+        st["codex_running_until"] = 0
+        snap = dirty_sources(resolve(root, sid))
+        if snap is not None:
+            st["git_snapshot"] = snap   # Codex 的改动不算到 Claude 的命令行改动里
         c = st["codex"]
         c["runs"] += 1
         c["read_runs" if a.mode == "read" else "write_runs"] += 1

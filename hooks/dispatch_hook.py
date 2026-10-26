@@ -85,8 +85,9 @@ def _debug(event, inp):
 def on_session_start(inp):
     sid = inp.get("session_id")
     r = dp.resolve(inp.get("cwd"), sid, bind=True)
-    with dp.session(sid, r["root"]):
-        pass
+    with dp.session(sid, r["root"]) as st:
+        if r["effective"] >= 1 and st.get("git_snapshot") is None:
+            st["git_snapshot"] = dp.dirty_sources(r)   # 基线：会话开始前已有的改动不算 Claude 的
     line = dp.summary_line(r)
     text = "[codex-dispatch] %s\n项目根：%s\n%s" % (line, r["root"], _rules(r["effective"], r["budget"], sid))
     out = _ctx("SessionStart", text)
@@ -155,7 +156,7 @@ def _is_analysis_file(path, r):
 
 def on_post_tool(inp):
     tool = inp.get("tool_name")
-    if tool not in EDIT_TOOLS + ("Bash",):
+    if tool not in EDIT_TOOLS + ("Bash", "PowerShell"):
         return
     sid = inp.get("session_id")
     r = dp.resolve(inp.get("cwd"), sid, bind=True)
@@ -184,23 +185,40 @@ def _post_tool_update(st, r, sid, tool, inp):
             if key not in sd["files"]:
                 sd["files"].append(key)
             sd["lines"] += added + removed
+            snap = st.get("git_snapshot")
+            if isinstance(snap, dict):           # 编辑工具改的已记账，别再被命令行检测算一次
+                try:
+                    snap[key] = os.path.getmtime(path if os.path.isabs(path) else os.path.join(r["root"], path))
+                except OSError:
+                    pass
         elif _is_analysis_file(path, r):
             analysis = True
     else:
-        if _is_analysis_command(tin.get("command")):
+        cmd = tin.get("command") or ""
+        if _is_analysis_command(cmd):
             analysis = True
-        for p in _bash_changed_files(resp):
-            if dp.is_source(p, r):
-                key = dp.file_key(dp.rel_in_root(p, r["root"]))
-                if key not in st["claude"]["shell_files"]:
-                    st["claude"]["shell_files"].append(key)
-                sd = st["since_decision"]
-                if key not in sd["files"]:
-                    sd["files"].append(key)
-                if r["effective"] >= 3 and not dp.active_waiver(st, os.path.join(r["root"], key)):
-                    st["violations"].append({"time": time.time(), "kind": "shell_edit", "file": key})
-                    notes.append("[codex-dispatch] 档位 3：刚才的命令改了源码 %s（命令行改文件拦不住，已记为违规）。"
-                                 "如果这不是有意的小修，用 git 撤回并改为派给 Codex。" % key)
+        is_dispatch = "dispatch-codex.ps1" in cmd
+        if is_dispatch and tin.get("run_in_background"):
+            st["codex_running_until"] = time.time() + dp.CODEX_RUNNING_MAX
+        changed = [dp.rel_in_root(p, r["root"]) for p in _bash_changed_files(resp) if dp.is_source(p, r)]
+        if r["effective"] >= 1:
+            cur = dp.dirty_sources(r)
+            prev = st.get("git_snapshot")
+            if cur is not None:
+                if isinstance(prev, dict) and not is_dispatch and not dp.codex_running(st):
+                    changed += [k for k, m in cur.items() if prev.get(k) != m]
+                st["git_snapshot"] = cur
+        for rel in dict.fromkeys(c for c in changed if c):
+            key = dp.file_key(rel)
+            if key not in st["claude"]["shell_files"]:
+                st["claude"]["shell_files"].append(key)
+            sd = st["since_decision"]
+            if key not in sd["files"]:
+                sd["files"].append(key)
+            if r["effective"] >= 3 and not dp.active_waiver(st, os.path.join(r["root"], rel)):
+                st["violations"].append({"time": time.time(), "kind": "shell_edit", "file": key})
+                notes.append("[codex-dispatch] 档位 3：刚才的命令改了源码 %s（命令行改文件拦不住，已记为违规）。"
+                             "如果这不是有意的小修，用 git 撤回并改为派给 Codex。" % rel)
 
     eff = r["effective"]
     if analysis:
