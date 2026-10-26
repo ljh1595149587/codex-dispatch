@@ -49,11 +49,11 @@ class Env(unittest.TestCase):
         with open(os.path.join(self.proj, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
             f.write(data if isinstance(data, str) else json.dumps(data))
 
-    def hook(self, event, payload):
+    def hook(self, event, payload, proc_cwd=None):
         payload.setdefault("session_id", "s1")
         payload.setdefault("cwd", self.proj)
         p = subprocess.run([sys.executable, HOOK, event], input=json.dumps(payload).encode("utf-8"),
-                           capture_output=True, env=os.environ.copy())
+                           capture_output=True, env=os.environ.copy(), cwd=proc_cwd)
         self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace"))
         out = p.stdout.decode("utf-8").strip()
         return json.loads(out) if out else None
@@ -209,6 +209,86 @@ class TestHooks(Env):
         self.proj_cfg({"level": 1})
         w = lambda: self.hook("post-tool", {"tool_name": "Write", "tool_input": {  # noqa: E731
             "file_path": os.path.join(self.tmp, "scratch", "x.py"), "content": "print(1)\n"}, "tool_response": {}})
+        self.assertIsNone(w())
+        self.assertIsNotNone(w())
+
+    def test_edit_scripts_are_not_analysis(self):
+        # 两次真实误报的形状：读文件 → replace → 写回；合并 JSON 配置
+        self.proj_cfg({"level": 1})
+        replace_back = ("cd proj && python - <<'EOF'\np='task_plan.md'; s=open(p,encoding='utf-8').read()\n"
+                        + "s=s.replace('旧的一段很长的文字……','新的一段很长的文字……')\n" * 6
+                        + "open(p,'w',encoding='utf-8').write(s)\nEOF")
+        merge_json = ("python - <<'EOF'\nimport json,os\np=os.path.expanduser('~/.claude/settings.json')\n"
+                      "d=json.load(open(p,encoding='utf-8'))\nd.setdefault('hooks',{})\n"
+                      "d['hooks']['Stop']=[{'hooks':[{'type':'command','command':'python x.py stop'}]}]\n"
+                      "with open(p+'.tmp','w',encoding='utf-8') as f:\n    json.dump(d,f,ensure_ascii=False,indent=2)\n"
+                      "os.replace(p+'.tmp',p)\nprint('ok')\nEOF")
+        for c in (replace_back, merge_json) * 2:   # 算分析的话第 2 次就会提醒
+            self.assertIsNone(self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": c}, "tool_response": {}}))
+
+    def test_stats_that_write_a_report_still_count(self):
+        self.proj_cfg({"level": 1})
+        cmd = ("python - <<'EOF'\nimport json\nfrom collections import Counter\nc=Counter()\n"
+               "for l in open('app.log',encoding='utf-8'):\n    c[l.split()[2]]+=1\n"
+               "json.dump(c.most_common(20),open('/tmp/top.json','w'))\nprint(c.most_common(5))\nEOF")
+        bash = lambda: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}})  # noqa: E731
+        self.assertIsNone(bash())
+        self.assertIsNotNone(bash())
+
+    def test_json_dump_to_stdout_is_not_a_write(self):
+        self.proj_cfg({"level": 1})
+        cmd = "python - <<'EOF'\nimport json,sys\nd=json.load(open('a.json'))\n" + "x=1\n" * 6 + "json.dump(d,sys.stdout)\nEOF"
+        bash = lambda: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}})  # noqa: E731
+        self.assertIsNone(bash())
+        self.assertIsNotNone(bash())
+
+    def test_scratch_edit_script_file_not_counted(self):
+        self.proj_cfg({"level": 1})
+        body = "p='task_plan.md'\ns=open(p,encoding='utf-8').read().replace('a','b')\nopen(p,'w',encoding='utf-8').write(s)\n"
+        w = lambda: self.hook("post-tool", {"tool_name": "Write", "tool_input": {  # noqa: E731
+            "file_path": os.path.join(self.tmp, "scratch", "fix.py"), "content": body}, "tool_response": {}})
+        for _ in range(3):
+            self.assertIsNone(w())
+
+    def test_edit_outside_project_not_in_temp_not_counted(self):
+        # cwd 漂到别的目录后改本仓库的 .py：项目外、不在临时目录 ⇒ 不是分析脚本
+        self.proj_cfg({"level": 1})
+        other = os.path.join(os.path.splitdrive(self.tmp)[0] + os.sep, "work", "other-repo", "hook.py")
+        e = lambda: self.hook("post-tool", {"tool_name": "Edit", "tool_input": {  # noqa: E731
+            "file_path": other, "old_string": "a", "new_string": "b"}, "tool_response": {}})
+        for _ in range(3):
+            self.assertIsNone(e())
+
+    def test_write_and_stdout_forms(self):
+        # 两轮审查 10-26 提出的写法（本次修的那几条）
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dispatch_hook", HOOK)
+        h = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(h)
+        for code in ("open(p,'wt',encoding='utf-8').write(s)", "open(Path(p), 'w').write(s)",
+                     "open(mode='w', file=p).write(s)", "io.open(p,'w',encoding='utf-8',newline='').write(s)",
+                     "open(p, \"a\").write(s)", "open(p,'r+').write(s)", "json.dump(d, open(p, 'w'))"):
+            self.assertTrue(h._is_edit_script(code), code)
+        for code in ("s=open(p).read()", "s=open(p,'r',encoding='utf-8').read()", "s=open(p,'rb').read()",
+                     "json.dump(sorted(rows), sys.stdout)", "open(p).read().replace(',', 'w')"):
+            self.assertFalse(h._is_edit_script(code), code)
+        self.assertFalse(h._is_edit_script(123))
+
+    def test_write_non_string_content_still_counts(self):
+        self.proj_cfg({"level": 1})
+        w = lambda: self.hook("post-tool", {"tool_name": "Write", "tool_input": {  # noqa: E731
+            "file_path": os.path.join(self.tmp, "scratch", "x.py"), "content": 123}, "tool_response": {}})
+        self.assertIsNone(w())
+        self.assertIsNotNone(w())          # 没抛异常、照常计数
+        self.assertEqual(self.errors(), "")
+
+    def test_relative_path_outside_root_resolved_against_root(self):
+        # proj 在 <临时目录>/cdp-*/proj：../x.py 按项目根解析落在临时目录 ⇒ 算分析脚本；
+        # 钩子进程 cwd 放在盘符根，按进程 cwd 解析会得到 <盘符>/x.py ⇒ 不算（旧代码的错）
+        self.proj_cfg({"level": 1})
+        drive_root = os.path.splitdrive(self.tmp)[0] + os.sep
+        w = lambda: self.hook("post-tool", {"tool_name": "Write", "tool_input": {  # noqa: E731
+            "file_path": os.path.join("..", "x.py"), "content": "print(1)\n"}, "tool_response": {}}, proc_cwd=drive_root)
         self.assertIsNone(w())
         self.assertIsNotNone(w())
 

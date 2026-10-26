@@ -23,6 +23,16 @@ POLICY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 _INLINE = re.compile(r"\b(python3?|py)\b[^\n|;&]*?(\s-c\s|\s-\s*<<|\s<<)|\bawk\s+'", re.I)
 ANALYSIS_MIN_CHARS = 300
 ANALYSIS_MIN_LINES = 8
+# 编辑脚本（读文件→replace→写回、合并 JSON）不是分析：有写文件、没有统计 ⇒ 不计数。
+# 已知局限（两轮审查认可、回放数据定的取舍）：统计只用 len( 的分析会被当编辑漏计——把 len( 算统计会让约 10% 的编辑脚本
+# 重新误计；一条命令里分析段 + 编辑段整体判定；被替换的文本里恰好有 mean / sum( 时编辑仍会被计（与旧行为相同）
+_OPEN_ARGS = r"""\bopen\((?:[^()\n]|\([^()\n]*\))*"""        # 参数里允许一层括号：open(Path(p), 'w')
+_MODE = r"""['"](?=[rbt]*[wax+])[rwaxbt+]{1,4}['"]"""        # 'w' 'wb' 'wt' 'a' 'x' 'r+' 'w+'
+_WRITES = re.compile(_OPEN_ARGS + r",\s*" + _MODE + r"|" + _OPEN_ARGS + r"\bmode\s*=\s*" + _MODE
+                     + r"""|\.write_(text|bytes)\(|\bos\.(replace|rename)\(|\bshutil\.(move|copy\w*)\("""
+                     r"""|\bjson\.dump\((?![^\n]*sys\.std)""")
+_STATS = re.compile(r"\b(Counter|most_common|defaultdict|groupby|value_counts|statistics|mean|median"
+                    r"|percentile|quantile|histogram)\b|\bsum\(|\+=\s*1\b")
 
 
 def _out(obj):
@@ -137,8 +147,12 @@ def _bash_changed_files(resp):
     return found
 
 
+def _is_edit_script(code):
+    return isinstance(code, str) and _WRITES.search(code) is not None and _STATS.search(code) is None
+
+
 def _is_analysis_command(cmd):
-    if not cmd or not _INLINE.search(cmd):
+    if not cmd or not _INLINE.search(cmd) or _is_edit_script(cmd):
         return False
     return len(cmd) >= ANALYSIS_MIN_CHARS or cmd.count("\n") + 1 >= ANALYSIS_MIN_LINES
 
@@ -149,9 +163,12 @@ def _is_analysis_file(path, r):
     ext = os.path.splitext(path)[1].lower()
     if ext not in (".py", ".sh", ".ps1"):
         return False
+    # scratchpad、临时目录里写的脚本 = 一次性分析脚本；项目内写脚本算源码改动。
+    # 项目外但不在临时目录（cwd 漂到别处后改本仓库、改别的仓库）不算：那是改代码，不是写分析脚本
     rel = dp.rel_in_root(path, r["root"])
-    # 项目外（scratchpad、临时目录）写的脚本 = 一次性分析脚本；项目内写脚本算源码改动
-    return rel is None or re.search(r"(^|/)(scratch|scratchpad|tmp|temp)/", rel, re.I) is not None
+    # 相对路径和 rel_in_root 一样按项目根解析，不按钩子进程的 cwd
+    where = rel if rel is not None else os.path.abspath(os.path.join(r["root"], path)).replace("\\", "/")
+    return re.search(r"(^|/)(scratch|scratchpad|tmp|temp)/", where, re.I) is not None
 
 
 def on_post_tool(inp):
@@ -191,7 +208,7 @@ def _post_tool_update(st, r, sid, tool, inp):
                     snap[key] = os.path.getmtime(path if os.path.isabs(path) else os.path.join(r["root"], path))
                 except OSError:
                     pass
-        elif _is_analysis_file(path, r):
+        elif _is_analysis_file(path, r) and not (tool == "Write" and _is_edit_script(tin.get("content"))):
             analysis = True
     else:
         cmd = tin.get("command") or ""
