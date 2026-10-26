@@ -90,14 +90,50 @@ def _debug(event, inp):
         f.write(json.dumps({"t": time.time(), "event": event, "input": trim(inp)}, ensure_ascii=False) + "\n")
 
 
+# ---------------------------------------------------------------- 项目根与快照
+#
+# 钩子输入的 cwd 跟着 Bash 的 cd 走。只按 cwd 找根的话，cd 到普通目录（不是 git 仓库）后，
+# 本项目的文件全成了「项目外」：源码改动不记账、.py 被当分析脚本（10-26 实测）。所以：
+#   编辑工具 → 文件所在的 git 仓库；命令 → cwd 所在的 git 仓库；都不在仓库里 → 会话起始项目。
+
+def _session_root(inp, sid):
+    return dp.session_project(sid) or dp.project_root(inp.get("cwd"))
+
+
+def _pick_root(inp, sid, path=None):
+    if path:
+        base = path if os.path.isabs(path) else os.path.join(inp.get("cwd") or os.getcwd(), path)
+        g = dp.git_root(os.path.dirname(base))
+        if g:
+            return g
+    return dp.git_root(inp.get("cwd")) or _session_root(inp, sid)
+
+
+def _snapshots(st):
+    snaps = st.setdefault("git_snapshots", {})
+    old = st.pop("git_snapshot", None)                  # 旧格式：只存一份，属于会话起始项目
+    if isinstance(old, dict) and st.get("project"):
+        snaps.setdefault(dp.norm(st["project"]), old)
+    return snaps
+
+
+def _acct_key(st, root, rel):
+    """记账用的文件键。会话起始项目内是相对路径；别的仓库用「//仓库根/相对路径」——
+    相对路径不会以 / 开头，两类键不会撞（只带仓库名会撞：起始项目的 b/x.go 与仓库 b 的 x.go）。"""
+    if not st.get("project") or dp.norm(root) == dp.norm(st["project"]):
+        return dp.file_key(rel)
+    return dp.file_key("//" + os.path.abspath(root).replace("\\", "/").strip("/") + "/" + rel)
+
+
 # ---------------------------------------------------------------- 事件
 
 def on_session_start(inp):
     sid = inp.get("session_id")
     r = dp.resolve(inp.get("cwd"), sid, bind=True)
     with dp.session(sid, r["root"]) as st:
-        if r["effective"] >= 1 and st.get("git_snapshot") is None:
-            st["git_snapshot"] = dp.dirty_sources(r)   # 基线：会话开始前已有的改动不算 Claude 的
+        snaps = _snapshots(st)
+        if r["effective"] >= 1 and dp.norm(r["root"]) not in snaps:
+            snaps[dp.norm(r["root"])] = dp.dirty_sources(r)   # 基线：会话开始前已有的改动不算 Claude 的
     line = dp.summary_line(r)
     text = "[codex-dispatch] %s\n项目根：%s\n%s" % (line, r["root"], _rules(r["effective"], r["budget"], sid))
     out = _ctx("SessionStart", text)
@@ -110,20 +146,26 @@ def on_pre_tool(inp):
     if tool not in EDIT_TOOLS:
         return
     sid = inp.get("session_id")
-    r = dp.resolve(inp.get("cwd"), sid, bind=True)
-    if r["effective"] < 3:
-        return
     tin = inp.get("tool_input") or {}
     path = tin.get("file_path") or tin.get("notebook_path")
+    r = dp.resolve(inp.get("cwd"), sid, bind=True, root=_pick_root(inp, sid, path))
+    if r["effective"] < 3:
+        return
     if not dp.is_source(path, r):
         return
     with dp.session(sid, r["root"]) as st:
         if dp.active_waiver(st, path):
             return
         st["violations"].append({"time": time.time(), "kind": "blocked_edit", "file": path})
+    # 豁免按会话起始项目解析相对路径：文件在别的仓库时给绝对路径，否则登记了也放不行、还会误放起始项目的同名文件
+    home = st.get("project")
+    if home and dp.norm(home) != dp.norm(r["root"]):
+        wf = '"%s"' % os.path.abspath(path)
+    else:
+        wf = dp.rel_in_root(path, r["root"]) or os.path.basename(path)
     reason = ("[codex-dispatch] 生效档位 3：项目源码由 Codex 实现，Claude 不直接改。"
               "请把这项改动写成需求派给 Codex（codex-dispatch skill，写模式）。"
-              "确属必须自己做的小修，先登记理由再改：" + _cmd('decide self --reason "..." --files ' + (dp.rel_in_root(path, r["root"]) or os.path.basename(path)), sid))
+              "确属必须自己做的小修，先登记理由再改：" + _cmd('decide self --reason "..." --files ' + wf, sid))
     _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                  "permissionDecisionReason": reason}})
 
@@ -151,10 +193,20 @@ def _is_edit_script(code):
     return isinstance(code, str) and _WRITES.search(code) is not None and _STATS.search(code) is None
 
 
+# 只认「像路径」的片段：从开头 / 空白 / 引号 / = ( , 之后起，每段只有文件名字符。
+# 不能宽到「含 / 的连续非空白」——不带空格的 awk 统计程序（含 sx/n 这类除法）会被整段压掉（两轮审查 10-26）
+_PATHISH = re.compile(r"""(?:(?<=[\s"'=(,])|^)(?:[A-Za-z]:|~|\.{1,2})?(?:[/\\][\w.\-~%+@]+)+[/\\]?""")
+
+
+def _program_len(cmd):
+    """量程序有多长时，路径只按一个字符算：scratchpad 路径动辄 100+ 字符，一行 awk 也会被撑过门槛（10-26 实测）。"""
+    return len(_PATHISH.sub(lambda m: "P" if len(m.group(0)) > 30 else m.group(0), cmd))
+
+
 def _is_analysis_command(cmd):
     if not cmd or not _INLINE.search(cmd) or _is_edit_script(cmd):
         return False
-    return len(cmd) >= ANALYSIS_MIN_CHARS or cmd.count("\n") + 1 >= ANALYSIS_MIN_LINES
+    return _program_len(cmd) >= ANALYSIS_MIN_CHARS or cmd.count("\n") + 1 >= ANALYSIS_MIN_LINES
 
 
 def _is_analysis_file(path, r):
@@ -176,11 +228,38 @@ def on_post_tool(inp):
     if tool not in EDIT_TOOLS + ("Bash", "PowerShell"):
         return
     sid = inp.get("session_id")
-    r = dp.resolve(inp.get("cwd"), sid, bind=True)
+    tin = inp.get("tool_input") or {}
+    path = (tin.get("file_path") or tin.get("notebook_path")) if tool in EDIT_TOOLS else None
+    r = dp.resolve(inp.get("cwd"), sid, bind=True, root=_pick_root(inp, sid, path))
     with dp.session(sid, r["root"]) as st:
         notes = _post_tool_update(st, r, sid, tool, inp)
     if notes:
         _out(_ctx("PostToolUse", "\n".join(notes)))
+
+
+def _shell_changes(st, r, resp, is_dispatch, notes):
+    """命令改了 r 这个仓库里哪些源码：工具结果里的列表 + 前后两次 git 快照对比。第一次见到的仓库只记基线。"""
+    changed = [dp.rel_in_root(p, r["root"]) for p in _bash_changed_files(resp) if dp.is_source(p, r)]
+    if r["effective"] >= 1:
+        snaps = _snapshots(st)
+        nroot = dp.norm(r["root"])
+        cur = dp.dirty_sources(r)
+        prev = snaps.get(nroot)
+        if cur is not None:
+            if isinstance(prev, dict) and not is_dispatch and not dp.codex_running(st):
+                changed += [k for k, m in cur.items() if prev.get(k) != m]
+            snaps[nroot] = cur
+    for rel in dict.fromkeys(c for c in changed if c):
+        key = _acct_key(st, r["root"], rel)
+        if key not in st["claude"]["shell_files"]:
+            st["claude"]["shell_files"].append(key)
+        sd = st["since_decision"]
+        if key not in sd["files"]:
+            sd["files"].append(key)
+        if r["effective"] >= 3 and not dp.active_waiver(st, os.path.join(r["root"], rel)):
+            st["violations"].append({"time": time.time(), "kind": "shell_edit", "file": key})
+            notes.append("[codex-dispatch] 档位 3：刚才的命令改了源码 %s（命令行改文件拦不住，已记为违规）。"
+                         "如果这不是有意的小修，用 git 撤回并改为派给 Codex。" % rel)
 
 
 def _post_tool_update(st, r, sid, tool, inp):
@@ -193,7 +272,8 @@ def _post_tool_update(st, r, sid, tool, inp):
         path = tin.get("file_path") or tin.get("notebook_path")
         if dp.is_source(path, r):
             added, removed = dp.edit_counts(tool, tin, resp)
-            key = dp.file_key(dp.rel_in_root(path, r["root"]))
+            rel = dp.rel_in_root(path, r["root"])
+            key = _acct_key(st, r["root"], rel)
             f = st["claude"]["files"].setdefault(key, {"added": 0, "removed": 0, "edits": 0})
             f["added"] += added
             f["removed"] += removed
@@ -202,14 +282,22 @@ def _post_tool_update(st, r, sid, tool, inp):
             if key not in sd["files"]:
                 sd["files"].append(key)
             sd["lines"] += added + removed
-            snap = st.get("git_snapshot")
+            snap = _snapshots(st).get(dp.norm(r["root"]))
             if isinstance(snap, dict):           # 编辑工具改的已记账，别再被命令行检测算一次
                 try:
-                    snap[key] = os.path.getmtime(path if os.path.isabs(path) else os.path.join(r["root"], path))
+                    snap[dp.file_key(rel)] = os.path.getmtime(path if os.path.isabs(path) else os.path.join(r["root"], path))
                 except OSError:
                     pass
-        elif _is_analysis_file(path, r) and not (tool == "Write" and _is_edit_script(tin.get("content"))):
-            analysis = True
+        elif _is_analysis_file(path, r):
+            # 同一个脚本改了又改只算一个；整份重写（Write）算新脚本；写的是编辑脚本不算，之后改它也不算
+            fk = dp.norm(path if os.path.isabs(path) else os.path.join(r["root"], path))
+            seen = st.setdefault("analysis_files", [])
+            if tool == "Write":
+                analysis = not _is_edit_script(tin.get("content"))
+            else:
+                analysis = fk not in seen
+            if fk not in seen:
+                seen.append(fk)
     else:
         cmd = tin.get("command") or ""
         if _is_analysis_command(cmd):
@@ -217,25 +305,11 @@ def _post_tool_update(st, r, sid, tool, inp):
         is_dispatch = "dispatch-codex.ps1" in cmd
         if is_dispatch and tin.get("run_in_background"):
             st["codex_running_until"] = time.time() + dp.CODEX_RUNNING_MAX
-        changed = [dp.rel_in_root(p, r["root"]) for p in _bash_changed_files(resp) if dp.is_source(p, r)]
-        if r["effective"] >= 1:
-            cur = dp.dirty_sources(r)
-            prev = st.get("git_snapshot")
-            if cur is not None:
-                if isinstance(prev, dict) and not is_dispatch and not dp.codex_running(st):
-                    changed += [k for k, m in cur.items() if prev.get(k) != m]
-                st["git_snapshot"] = cur
-        for rel in dict.fromkeys(c for c in changed if c):
-            key = dp.file_key(rel)
-            if key not in st["claude"]["shell_files"]:
-                st["claude"]["shell_files"].append(key)
-            sd = st["since_decision"]
-            if key not in sd["files"]:
-                sd["files"].append(key)
-            if r["effective"] >= 3 and not dp.active_waiver(st, os.path.join(r["root"], rel)):
-                st["violations"].append({"time": time.time(), "kind": "shell_edit", "file": key})
-                notes.append("[codex-dispatch] 档位 3：刚才的命令改了源码 %s（命令行改文件拦不住，已记为违规）。"
-                             "如果这不是有意的小修，用 git 撤回并改为派给 Codex。" % rel)
+        _shell_changes(st, r, resp, is_dispatch, notes)
+        # cwd 在别的仓库时，命令照样可能改到会话起始项目（cd 过去改、绝对路径改）
+        home = st.get("project")
+        if home and dp.norm(home) != dp.norm(r["root"]):
+            _shell_changes(st, dp.resolve(inp.get("cwd"), sid, root=home), resp, is_dispatch, notes)
 
     eff = r["effective"]
     if analysis:
@@ -257,7 +331,7 @@ def _post_tool_update(st, r, sid, tool, inp):
 
 def on_stop(inp):
     sid = inp.get("session_id")
-    r = dp.resolve(inp.get("cwd"), sid)
+    r = dp.resolve(inp.get("cwd"), sid, root=_session_root(inp, sid))
     with dp.session(sid, r["root"]) as st:
         t = dp.session_totals(st)
         snap = [t["claude_files"], t["claude_added"], t["claude_removed"], t["shell_files"], t["codex_runs"]]
@@ -270,7 +344,7 @@ def on_stop(inp):
 
 def on_session_end(inp):
     sid = inp.get("session_id")
-    r = dp.resolve(inp.get("cwd"), sid)
+    r = dp.resolve(inp.get("cwd"), sid, root=_session_root(inp, sid))
     st = dp.load_state(sid, r["root"])
     t = dp.session_totals(st)
     if any(t.values()) or st["decisions"] or st["violations"]:

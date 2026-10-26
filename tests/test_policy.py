@@ -292,6 +292,22 @@ class TestHooks(Env):
         self.assertIsNone(w())
         self.assertIsNotNone(w())
 
+    def test_repeated_edit_of_same_scratch_script_counts_once(self):
+        self.proj_cfg({"level": 1})
+        p = os.path.join(self.tmp, "scratch", "probe.py")
+        e = lambda: self.hook("post-tool", {"tool_name": "Edit", "tool_input": {  # noqa: E731
+            "file_path": p, "old_string": "a", "new_string": "b"}, "tool_response": {}})
+        for _ in range(4):
+            self.assertIsNone(e())
+
+    def test_long_path_does_not_inflate_command_length(self):
+        self.proj_cfg({"level": 1})
+        long_path = os.path.join(self.tmp, "scratchpad", "x" * 60, "y" * 60, "data.json").replace("\\", "/")
+        cmd = "python -c \"import json;print(len(json.load(open('%s'))))\" && awk '{n++} END{print n}' %s" % (long_path, long_path)
+        self.assertGreaterEqual(len(cmd), 300)
+        for _ in range(3):
+            self.assertIsNone(self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}}))
+
     def test_level0_never_reminds(self):
         self.proj_cfg({"level": 0})
         cmd = "python - <<'EOF'\n" + "print(1)\n" * 10 + "EOF"
@@ -518,6 +534,119 @@ class TestShellDetection(Env):
         self.put("v.go")
         out = self.bash("echo y > v.go")
         self.assertIn("违规", out["hookSpecificOutput"]["additionalContext"])
+
+
+class TestCwdDrift(Env):
+    """Bash 里 cd 走之后，钩子输入的 cwd 也跟着走（10-26 实测）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.plain = os.path.join(self.tmp, "plain")          # 不是 git 仓库
+        self.other = os.path.join(self.tmp, "other")          # 另一个 git 仓库
+        os.makedirs(self.plain)
+        os.makedirs(self.other)
+        subprocess.run(["git", "init", "-q", self.other], check=True)
+
+    def test_edits_count_for_session_project_when_cwd_in_plain_dir(self):
+        self.proj_cfg({"level": 2})
+        self.hook("session-start", {})
+        ed = lambda n: self.hook("post-tool", {"cwd": self.plain, "tool_name": "Edit", "tool_input": {  # noqa: E731
+            "file_path": os.path.join(self.proj, n), "old_string": "a\n", "new_string": "a\nb\n"}, "tool_response": {}})
+        self.assertIsNone(ed("a.go"))
+        self.assertIsNone(ed("b.go"))
+        self.assertIn("必须登记", ed("c.go")["hookSpecificOutput"]["additionalContext"])
+
+    def test_edit_in_project_py_from_plain_cwd_is_not_analysis(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        ed = lambda: self.hook("post-tool", {"cwd": self.plain, "tool_name": "Edit", "tool_input": {  # noqa: E731
+            "file_path": os.path.join(self.proj, "hooks", "h.py"), "old_string": "a", "new_string": "b"}, "tool_response": {}})
+        for _ in range(3):
+            self.assertIsNone(ed())
+
+    def test_other_repo_level_applies_to_its_files(self):
+        self.proj_cfg({"level": 1})
+        os.makedirs(os.path.join(self.other, ".claude"))
+        with open(os.path.join(self.other, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+            json.dump({"level": 3}, f)
+        self.hook("session-start", {})
+        deny = self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.other, "x.go")}})
+        self.assertEqual(deny["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.proj, "x.go")}}))
+
+    def test_switching_repos_does_not_blame_preexisting_dirty_files(self):
+        self.proj_cfg({"level": 3})
+        with open(os.path.join(self.proj, "old.go"), "w") as f:
+            f.write("package x\n")                              # 会话开始前就有的改动
+        with open(os.path.join(self.other, "o.go"), "w") as f:
+            f.write("package o\n")
+        self.hook("session-start", {})
+        bash = lambda cwd: self.hook("post-tool", {"cwd": cwd, "tool_name": "Bash",  # noqa: E731
+                                                   "tool_input": {"command": "ls"}, "tool_response": {}})
+        self.assertIsNone(bash(self.other))
+        self.assertIsNone(bash(self.proj))
+        self.assertIsNone(bash(self.other))
+
+    def test_shell_edit_of_session_project_seen_from_plain_cwd(self):
+        self.proj_cfg({"level": 3})
+        self.hook("session-start", {})
+        with open(os.path.join(self.proj, "new.go"), "w") as f:
+            f.write("package x\n")
+        out = self.hook("post-tool", {"cwd": self.plain, "tool_name": "Bash",
+                                      "tool_input": {"command": "cd ../proj && echo > new.go"}, "tool_response": {}})
+        self.assertIn("违规", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_stop_reports_session_project(self):
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        self.hook("post-tool", {"cwd": self.plain, "tool_name": "Write", "tool_input": {
+            "file_path": os.path.join(self.proj, "a.go"), "content": "x\n"}, "tool_response": {}})
+        out = self.hook("stop", {"cwd": self.plain})
+        self.assertIn("Claude 改 1 文件", out["systemMessage"])
+
+    def test_foreign_repo_keys_do_not_collide_with_project_paths(self):
+        # 起始项目里的 other/x.go 与仓库 other 里的 x.go 是两个文件
+        self.proj_cfg({"level": 1})
+        self.hook("session-start", {})
+        for p in (os.path.join(self.proj, "other", "x.go"), os.path.join(self.other, "x.go")):
+            self.hook("post-tool", {"tool_name": "Write", "tool_input": {"file_path": p, "content": "x\n"}, "tool_response": {}})
+        self.assertIn("Claude 改 2 文件", self.hook("stop", {})["systemMessage"])
+
+    def test_waiver_from_deny_message_works_for_foreign_repo_only(self):
+        import re
+        self.proj_cfg({"level": 3})
+        os.makedirs(os.path.join(self.other, ".claude"))
+        with open(os.path.join(self.other, ".claude", "codex-dispatch.json"), "w", encoding="utf-8") as f:
+            json.dump({"level": 3}, f)
+        self.hook("session-start", {})
+        pre = lambda p: self.hook("pre-tool", {"tool_name": "Edit", "tool_input": {"file_path": p}})  # noqa: E731
+        foreign, mine = os.path.join(self.other, "src", "x.go"), os.path.join(self.proj, "src", "x.go")
+        reason = pre(foreign)["hookSpecificOutput"]["permissionDecisionReason"]
+        files = re.search(r'--files "([^"]+)"', reason).group(1)        # 照提示登记
+        self.assertEqual(self.policy("--session", "s1", "decide", "self", "--reason", "小修", "--files", files)[0], 0)
+        self.assertIsNone(pre(foreign))
+        self.assertEqual(pre(mine)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_compact_awk_stats_program_still_counts(self):
+        self.proj_cfg({"level": 1})
+        prog = "{sx+=$1;sy+=$2;sxx+=$1*$1;syy+=$2*$2;sxy+=$1*$2;n++}END{mx=sx/n;my=sy/n;vx=sxx/n-mx*mx;vy=syy/n-my*my;" \
+               "cv=sxy/n-mx*my;b=cv/vx;a=my-b*mx;r=cv/sqrt(vx*vy);printf(\"%.4f %.4f %.4f %.4f %.4f %.4f\\n\",mx,my,vx,vy,b,r);" \
+               "print a,b,r,n,mx,my,vx,vy,cv,sx/n,sy/n,sxx/n,syy/n,sxy/n;print (sx-sy)/n,(sxx-syy)/n,sqrt(vx),sqrt(vy)}"
+        cmd = "awk '%s' data.txt" % prog
+        self.assertGreaterEqual(len(cmd), 300)
+        bash = lambda: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}})  # noqa: E731
+        self.assertIsNone(bash())
+        self.assertIsNotNone(bash())
+
+    def test_old_single_snapshot_state_migrates(self):
+        self.proj_cfg({"level": 3})
+        with open(os.path.join(self.proj, "old.go"), "w") as f:
+            f.write("package x\n")
+        r = dp.resolve(self.proj)
+        with dp.session("s1", self.proj) as st:                # 旧格式状态：git_snapshot 只有一份
+            st.pop("git_snapshots", None)
+            st["git_snapshot"] = dp.dirty_sources(r)
+        self.assertIsNone(self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {}}))
 
 
 if __name__ == "__main__":

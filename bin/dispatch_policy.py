@@ -82,17 +82,21 @@ def is_log(rel):
     return file_key(rel) == file_key(LOG_REL)
 
 
-def project_root(cwd):
-    """cwd 所在 git 仓库的根（.git 是目录或文件都算）；不在仓库里就返回 cwd。"""
-    cur = os.path.abspath(cwd or os.getcwd())
-    probe = cur
+def git_root(p):
+    """p 所在 git 仓库的根（.git 是目录或文件都算）；不在任何仓库里返回 None。"""
+    probe = os.path.abspath(p or os.getcwd())
     while True:
         if os.path.exists(os.path.join(probe, ".git")):
             return probe
         parent = os.path.dirname(probe)
         if parent == probe:
-            return cur
+            return None
         probe = parent
+
+
+def project_root(cwd):
+    """cwd 所在 git 仓库的根；不在仓库里就返回 cwd。"""
+    return git_root(cwd) or os.path.abspath(cwd or os.getcwd())
 
 
 def project_cfg_path(root):
@@ -168,9 +172,9 @@ def find_override(root, session_id, bind=False):
     return hit
 
 
-def resolve(cwd, session_id=None, bind=False):
-    """算出本次生效的档位。永不抛异常：配置有问题就带着警告回到默认值。"""
-    root = project_root(cwd)
+def resolve(cwd, session_id=None, bind=False, root=None):
+    """算出本次生效的档位。永不抛异常：配置有问题就带着警告回到默认值。root 给了就不再由 cwd 推。"""
+    root = root or project_root(cwd)
     warnings = []
     ucfg, err = _load_json(user_cfg_path())
     if err:
@@ -365,7 +369,8 @@ def new_state(sid, root):
     return {
         "session_id": sid, "project": root, "created": time.time(), "updated": time.time(),
         "claude": {"files": {}, "shell_files": []},
-        "analysis_scripts": 0, "analysis_next_remind": ANALYSIS_REMIND_FIRST,
+        "analysis_scripts": 0, "analysis_next_remind": ANALYSIS_REMIND_FIRST, "analysis_files": [],
+        "git_snapshots": {},   # norm(仓库根) → dirty_sources 快照；会话里碰到几个仓库就各存一份
         "since_decision": {"files": [], "lines": 0, "reminded_at_files": 0},
         "decisions": [], "waivers": [], "violations": [],
         "codex": {"runs": 0, "read_runs": 0, "write_runs": 0, "added": 0, "removed": 0, "files": 0},
@@ -380,6 +385,12 @@ def load_state(sid, root):
     base = new_state(sid, root)
     base.update(data)
     return base
+
+
+def session_project(sid):
+    """会话起始项目（第一次建状态时的项目根）；还没有状态返回 None。只读、不加锁。"""
+    data, _ = _load_json(_session_path(sid))
+    return (data or {}).get("project")
 
 
 def save_state(st):
@@ -642,7 +653,7 @@ def cmd_record_codex(a, added=0, removed=0, nfiles=0):
         st["codex_running_until"] = 0
         snap = dirty_sources(resolve(root, sid))
         if snap is not None:
-            st["git_snapshot"] = snap   # Codex 的改动不算到 Claude 的命令行改动里
+            st.setdefault("git_snapshots", {})[norm(root)] = snap   # Codex 的改动不算到 Claude 的命令行改动里
         c = st["codex"]
         c["runs"] += 1
         c["read_runs" if a.mode == "read" else "write_runs"] += 1
