@@ -6,6 +6,7 @@
 纪律：任何异常都放行（exit 0、无输出）并记到 state 目录的 errors.log。
 工具链自己出故障时不能卡住正常工作；唯一有意的拦截是档位 3 下 Claude 直接改源码。
 """
+import hashlib
 import json
 import os
 import re
@@ -233,6 +234,27 @@ def _is_analysis_command(cmd):
     return _program_len(cmd) >= ANALYSIS_MIN_CHARS or cmd.count("\n") + 1 >= ANALYSIS_MIN_LINES
 
 
+# 同一段内联程序重跑（改完文档再跑一遍链接校验、换个参数再渲染一次）只算一个，和「同一个脚本文件改了又改只算一个」同口径。
+# 判据：较短一方的行有多少在另一方里。回放 10-29 前全部会话 1982 条：0.9 判重跑 20 条，逐条看都是重跑；
+# 0.75 判 75 条，混进了「同一份数据换个口径统计」——那正是该提醒派给 Codex 的，所以取 0.9
+RERUN_MIN_OVERLAP = 0.9
+RERUN_KEEP = 30
+
+
+def _program_lines(cmd):
+    t = _PATHISH.sub("P", cmd)
+    return sorted({hashlib.md5(s.encode("utf-8")).hexdigest()[:8] for s in (l.strip() for l in t.splitlines()) if len(s) > 3})
+
+
+def _is_rerun(lines, seen):
+    a = set(lines)
+    for prev in seen:
+        b = set(prev)
+        if a and b and len(a & b) / min(len(a), len(b)) >= RERUN_MIN_OVERLAP:
+            return True
+    return False
+
+
 def _is_analysis_file(path, r):
     if not path:
         return False
@@ -418,7 +440,12 @@ def _post_tool_update(st, r, sid, tool, inp):
     else:
         cmd = tin.get("command") or ""
         if _is_analysis_command(cmd):
-            analysis = True
+            lines = _program_lines(cmd)
+            progs = st.setdefault("analysis_programs", [])
+            analysis = not _is_rerun(lines, progs)
+            if analysis:
+                progs.append(lines)
+                del progs[:-RERUN_KEEP]
         is_dispatch = "dispatch-codex.ps1" in cmd
         if is_dispatch and tin.get("run_in_background"):
             st["codex_running_until"] = time.time() + dp.CODEX_RUNNING_MAX

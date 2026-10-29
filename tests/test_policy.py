@@ -201,14 +201,41 @@ class TestHooks(Env):
 
     def test_analysis_script_reminder(self):
         self.proj_cfg({"level": 1})
-        cmd = "python - <<'EOF'\n" + "print(1)\n" * 10 + "EOF"
+        cmd = lambda n: "python - <<'EOF'\n" + "".join("print('q%d-%d')\n" % (n, i) for i in range(10)) + "EOF"  # noqa: E731
         bash = lambda c: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": c}, "tool_response": {}})  # noqa: E731
         self.assertIsNone(bash("ls -la"))
-        self.assertIsNone(bash(cmd))
-        self.assertIn("第 2 个分析脚本", bash(cmd)["hookSpecificOutput"]["additionalContext"])
-        self.assertIsNone(bash(cmd))
-        self.assertIsNone(bash(cmd))
-        self.assertIsNotNone(bash(cmd))
+        self.assertIsNone(bash(cmd(1)))
+        self.assertIn("第 2 个分析脚本", bash(cmd(2))["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(bash(cmd(3)))
+        self.assertIsNone(bash(cmd(4)))
+        self.assertIsNotNone(bash(cmd(5)))
+
+    def test_rerun_of_same_program_counts_once(self):
+        # 10-29 实测：改完文档就把同一段链接校验内联重跑一遍，8 次全被算成新分析脚本
+        self.proj_cfg({"level": 1})
+        check = ("cd \"d:/work/%s\" && python - <<'EOF'\nimport re, os, glob\n"
+                 "files = glob.glob('*.md') + glob.glob('templates/*.md')\nbad = 0\nfor f in files:\n"
+                 "    for m in re.finditer(r'\\]\\(([^)]+)\\)', open(f, encoding='utf-8').read()):\n"
+                 "        if not m.group(1).startswith('http') and not os.path.exists(m.group(1).partition('#')[0]):\n"
+                 "            bad += 1; print(f, m.group(1))\nprint('bad', bad)\n%sEOF")
+        other = "python - <<'EOF'\nfrom collections import Counter\n" + "".join("x%d = %d\n" % (i, i) for i in range(8)) + "EOF"
+        bash = lambda c: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": c}, "tool_response": {}})  # noqa: E731
+        self.assertIsNone(bash(check % ("playbook", "")))
+        self.assertIsNone(bash(check % ("playbook", "")))                              # 原样重跑
+        self.assertIsNone(bash(check % ("another/long/project/dir", "")))               # 只换了路径
+        self.assertEqual(dp.load_state("s1", self.proj)["analysis_scripts"], 1)
+        self.assertIsNotNone(bash(other))                                                # 真正不同的程序照常计数
+        self.assertEqual(dp.load_state("s1", self.proj)["analysis_scripts"], 2)
+
+    def test_changed_program_is_not_a_rerun(self):
+        # 10 行里改掉 2 行（重合 0.8 < 0.9）：换了口径的统计，照常计数
+        self.proj_cfg({"level": 1})
+        base = ["print('line %d')" % i for i in range(10)]
+        changed = base[:8] + ["print('changed %d')" % i for i in range(2)]
+        prog = lambda ls: "python - <<'EOF'\n" + "\n".join(ls) + "\nEOF"  # noqa: E731
+        bash = lambda c: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": c}, "tool_response": {}})  # noqa: E731
+        self.assertIsNone(bash(prog(base)))
+        self.assertIsNotNone(bash(prog(changed)))
 
     def test_analysis_file_outside_project(self):
         self.proj_cfg({"level": 1})
@@ -236,16 +263,16 @@ class TestHooks(Env):
         cmd = ("python - <<'EOF'\nimport json\nfrom collections import Counter\nc=Counter()\n"
                "for l in open('app.log',encoding='utf-8'):\n    c[l.split()[2]]+=1\n"
                "json.dump(c.most_common(20),open('/tmp/top.json','w'))\nprint(c.most_common(5))\nEOF")
-        bash = lambda: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}})  # noqa: E731
-        self.assertIsNone(bash())
-        self.assertIsNotNone(bash())
+        bash = lambda c: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": c}, "tool_response": {}})  # noqa: E731
+        self.assertIsNone(bash(cmd))
+        self.assertIsNotNone(bash(cmd.replace("app.log", "other.log")))   # 原样再跑算重跑，所以换一份输入
 
     def test_json_dump_to_stdout_is_not_a_write(self):
         self.proj_cfg({"level": 1})
         cmd = "python - <<'EOF'\nimport json,sys\nd=json.load(open('a.json'))\n" + "x=1\n" * 6 + "json.dump(d,sys.stdout)\nEOF"
-        bash = lambda: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}})  # noqa: E731
-        self.assertIsNone(bash())
-        self.assertIsNotNone(bash())
+        bash = lambda c: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": c}, "tool_response": {}})  # noqa: E731
+        self.assertIsNone(bash(cmd))
+        self.assertIsNotNone(bash(cmd.replace("a.json", "b.json")))
 
     def test_scratch_edit_script_file_not_counted(self):
         self.proj_cfg({"level": 1})
@@ -638,11 +665,12 @@ class TestCwdDrift(Env):
         prog = "{sx+=$1;sy+=$2;sxx+=$1*$1;syy+=$2*$2;sxy+=$1*$2;n++}END{mx=sx/n;my=sy/n;vx=sxx/n-mx*mx;vy=syy/n-my*my;" \
                "cv=sxy/n-mx*my;b=cv/vx;a=my-b*mx;r=cv/sqrt(vx*vy);printf(\"%.4f %.4f %.4f %.4f %.4f %.4f\\n\",mx,my,vx,vy,b,r);" \
                "print a,b,r,n,mx,my,vx,vy,cv,sx/n,sy/n,sxx/n,syy/n,sxy/n;print (sx-sy)/n,(sxx-syy)/n,sqrt(vx),sqrt(vy)}"
-        cmd = "awk '%s' data.txt" % prog
-        self.assertGreaterEqual(len(cmd), 300)
-        bash = lambda: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_response": {}})  # noqa: E731
-        self.assertIsNone(bash())
-        self.assertIsNotNone(bash())
+        cmd = "awk '%s' data%d.txt"
+        self.assertGreaterEqual(len(cmd % (prog, 1)), 300)
+        bash = lambda n: self.hook("post-tool", {"tool_name": "Bash", "tool_input": {"command": cmd % (prog, n)},  # noqa: E731
+                                                 "tool_response": {}})
+        self.assertIsNone(bash(1))
+        self.assertIsNotNone(bash(2))           # 同一段程序原样再跑算重跑，所以换一份数据
 
     def _record_codex(self, root, sid=None):
         env = os.environ.copy()
