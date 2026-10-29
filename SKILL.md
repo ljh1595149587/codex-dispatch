@@ -72,6 +72,16 @@ $S = Split-Path (Split-Path $D -Parent) -Parent
 & $D -Mode write -Prompt "..." -Effort high               # 核心代码、高风险改动
 ```
 
+**写模式前置检查**：项目 `.claude/codex-dispatch.json` 里配 `"check": "pnpm typecheck && pnpm test"`（不能含双引号）。
+派写模式前，脚本把它在本机和 Codex 沙箱（`codex sandbox -P :workspace`，不经模型、不花额度）里各跑一次：
+本机过、沙箱不过 = 环境问题，**退出码 4，不派**，并打出沙箱里的报错；两边都不过 = 测试本来就红，放行。
+通过的结果 24 小时内复用（`~/.codex/config.toml` 或 check 一变就重跑）。
+- `& $D -CheckOnly -Root <项目根>`：只检查不派活，忽略缓存。项目切到档位 2 之前先跑一次
+- `-SkipCheck`：环境修好前应急。用了就要在验收时自己跑 check，并记进派活日志
+- 退出码 4 多半是沙箱账号（组 CodexSandboxUsers）读不到某个安装目录：`icacls <目录>` 查，
+  缺就请用户执行 `icacls <目录> /grant 'CodexSandboxUsers:(OI)(CI)RX'`（改权限由用户自己经手）
+- 没配 check 时只提示、不拦
+
 **推理强度 `-Effort`**：不传时审查用 high，其余用 medium，不跟 `~/.codex/config.toml` 的全局值走。
 核心代码、高风险改动手动传 high 或 ultra。强度越高，Codex 越会把边角情况挨个防一遍，写出没人要求的校验和重试。
 派活日志里记下这次用的强度。

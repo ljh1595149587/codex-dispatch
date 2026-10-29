@@ -136,7 +136,7 @@ if ($py) {
 
 Write-Host "`n[5] 参数契约" -ForegroundColor Cyan
 $sig = Get-Command $script
-foreach ($p in @('Mode', 'Prompt', 'Review', 'Round2Only', 'Root', 'Cwd', 'Budget', 'AnswerKey', 'Effort')) {
+foreach ($p in @('Mode', 'Prompt', 'Review', 'Round2Only', 'Root', 'Cwd', 'Budget', 'AnswerKey', 'Effort', 'SkipCheck', 'CheckOnly')) {
     Check "参数 -$p 存在" $sig.Parameters.ContainsKey($p)
 }
 Check "-Root 默认当前目录（脚本已脱离项目树）" ($sig.Parameters['Root'].Attributes.Count -ge 0)
@@ -194,6 +194,55 @@ try {
     Check "守卫先于 Codex 调用（未产生事件流）" (-not (Test-Path (Join-Path $guardTmp '.codex-stream.jsonl')))
 } finally {
     Remove-Item $guardTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "`n[8a] 写模式前置检查（本机 vs Codex 沙箱，不经模型）" -ForegroundColor Cyan
+# 10-29 实测：沙箱以单独账号运行，装在关了继承的目录里的 node / python 它用不了。
+# 前置检查按「本机过、沙箱不过」判环境问题；「两边都不过」是测试本来就红，要放行。
+$pcTmp = Join-Path ([IO.Path]::GetTempPath()) ("dispatch-precheck-" + [guid]::NewGuid().ToString('N'))
+$pcHome = Join-Path $pcTmp 'home'
+New-Item -ItemType Directory -Path (Join-Path $pcTmp '.claude'), $pcHome -Force | Out-Null
+git -C $pcTmp init -q 2>$null
+$oldHome = $env:CODEX_DISPATCH_HOME
+$env:CODEX_DISPATCH_HOME = $pcHome
+function Set-Check($c) {
+    $cfg = Join-Path $pcTmp '.claude\codex-dispatch.json'
+    if ($null -eq $c) { Remove-Item $cfg -ErrorAction SilentlyContinue; return }
+    [IO.File]::WriteAllText($cfg, (@{ level = 1; check = $c } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+}
+function Run-Check { $script:pcOut = & powershell -NoProfile -File $script -CheckOnly -Root $pcTmp 2>&1 | Out-String; return $LASTEXITCODE }
+try {
+    Set-Check 'node -v && python -V'
+    $c = Run-Check
+    Check "工具都在：放行（退出码 $c）" ($c -eq 0 -and $pcOut -match '通过') $pcOut.Trim()
+    Check "通过后写入缓存" (Test-Path (Join-Path $pcHome 'codex-dispatch-state\check-cache.json'))
+
+    Set-Check 'echo x> %USERPROFILE%\.cdx-precheck-probe.tmp && del %USERPROFILE%\.cdx-precheck-probe.tmp'
+    $c = Run-Check
+    Check "本机过、沙箱不过：判环境问题，退出码 4（实际 $c）" ($c -eq 4 -and $pcOut -match 'CodexSandboxUsers') $pcOut.Trim()
+
+    Set-Check 'npm -v && cmd /c exit 3'
+    $c = Run-Check
+    Check "两边都不过（测试本来就红）：放行（退出码 $c）" ($c -eq 0 -and $pcOut -match '红') $pcOut.Trim()
+
+    Set-Check 'python -c "print(1)"'
+    $c = Run-Check
+    Check "check 带双引号：拒绝并说明（退出码 $c）" ($c -eq 1 -and $pcOut -match '双引号') $pcOut.Trim()
+
+    Set-Check $null
+    $c = Run-Check
+    Check "没配 check 时 -CheckOnly 报错（退出码 $c）" ($c -eq 1 -and $pcOut -match '没配 check') $pcOut.Trim()
+
+    # 写模式：环境有问题时必须在调用 Codex 之前停下
+    Set-Check 'echo x> %USERPROFILE%\.cdx-precheck-probe.tmp && del %USERPROFILE%\.cdx-precheck-probe.tmp'
+    git -C $pcTmp add -A 2>$null; git -C $pcTmp -c user.name=t -c user.email=t@t commit -qm init 2>$null
+    $out = & powershell -NoProfile -File $script -Mode write -Prompt 'x' -Root $pcTmp 2>&1 | Out-String
+    Check "写模式遇环境问题：退出码 4 且没有调用 Codex" ($LASTEXITCODE -eq 4 -and
+        -not (Test-Path (Join-Path $pcTmp '.codex-stream.jsonl'))) $out.Trim()
+} finally {
+    $env:CODEX_DISPATCH_HOME = $oldHome
+    Remove-Item (Join-Path $env:USERPROFILE '.cdx-precheck-probe.tmp') -ErrorAction SilentlyContinue
+    Remove-Item $pcTmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "`n[8] 档位与钩子（tests\test_policy.py）" -ForegroundColor Cyan

@@ -60,7 +60,15 @@ param(
     # 写模式的受保护路径（逗号分隔的 glob，相对项目根，如 "tests/acceptance/*"）。
     # 验收测试由非实现方写好，Codex 为了让测试通过去改测试本身 = 不合格，脚本直接判退出码 3。
     [Parameter(ParameterSetName = 'Task')]
-    [string]$Protect = ''
+    [string]$Protect = '',
+
+    # 写模式前置检查（见下文 Invoke-PreCheck）。-SkipCheck 跳过，用了的话验收时 Claude 必须自己跑 check
+    [Parameter(ParameterSetName = 'Task')]
+    [switch]$SkipCheck,
+
+    # 只做前置检查、不派活：忽略缓存重跑一遍，退出码 0 = 能派写模式，4 = 环境问题
+    [Parameter(Mandatory = $true, ParameterSetName = 'Check')]
+    [switch]$CheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,6 +135,116 @@ if (-not (Test-Path $codex)) {
     if ($found) { $codex = $found }
 }
 if (-not (Test-Path $codex)) { Write-Host "找不到 codex 原生 exe" -ForegroundColor Red; exit 1 }
+
+# ---------------------------------------------------------------- 写模式前置检查
+# Codex 的 Windows 沙箱以单独的本机账号运行（codexsandboxoffline，组 CodexSandboxUsers）。
+# 装在关了权限继承的目录里的 node / python，PATH 传进去了，程序却 Access denied（10-29 实测）。
+# 沙箱跑不了 check，写模式就会变成「Codex 写 → 跑不了 → Claude 跑 → 再派回去」，最后 Claude 全包。
+# 所以派写模式前，把项目 .claude/codex-dispatch.json 的 check 在本机和沙箱里各跑一次，按差异判：
+#   本机过、沙箱不过 → 环境问题，拒绝（退出码 4）
+#   两边都不过     → 测试本来就红（验收测试先写好、等实现），不是环境问题，放行
+# 两边都不过时环境也可能坏着，所以先逐个探 check 用到的工具（<工具> --version），同样按差异判。
+# 沙箱用 codex sandbox -P :workspace：不经模型、不花额度，和写模式派活同一个账号、同一套权限。
+$checkCache = Join-Path $(if ($env:CODEX_DISPATCH_HOME) { $env:CODEX_DISPATCH_HOME } else { Join-Path $env:USERPROFILE '.claude' }) 'codex-dispatch-state\check-cache.json'
+$checkTtlHours = 24
+
+function Get-CheckCommand {
+    $cfg = Join-Path $root '.claude\codex-dispatch.json'
+    if (-not (Test-Path $cfg)) { return '' }
+    try { $c = (Get-Content $cfg -Raw -Encoding UTF8 | ConvertFrom-Json).check } catch { return '' }
+    if ($c -is [string]) { return $c.Trim() }
+    return ''
+}
+
+# 本机和沙箱各跑一次同一行命令，返回两边的退出码和沙箱输出
+function Invoke-Both($line) {
+    $o = Join-Path $env:TEMP 'codex-precheck-out.txt'
+    $e = Join-Path $env:TEMP 'codex-precheck-err.txt'
+    $run = {
+        param($exe, $argLine)
+        Remove-Item $o, $e -ErrorAction SilentlyContinue
+        $p = Start-Process -FilePath $exe -ArgumentList $argLine -WorkingDirectory $root -NoNewWindow -PassThru `
+            -RedirectStandardOutput $o -RedirectStandardError $e
+        $null = $p.Handle          # PS 5.1：不先取句柄，-NoNewWindow 下 ExitCode 读出来是空的
+        $p.WaitForExit()
+        $text = (Get-Content $o, $e -Encoding Default -ErrorAction SilentlyContinue) -join "`n"
+        return @($p.ExitCode, $text)
+    }
+    # 参数整串交给 Start-Process，不经 PS 的原生参数拼接（PS 5.1 会弄坏带引号的参数）
+    $h = & $run 'cmd.exe' "/d /s /c `"$line`""
+    $s = & $run $codex "sandbox -P :workspace -C `"$root`" -- cmd.exe /d /s /c `"$line`""
+    return @{ Host = $h[0]; Sandbox = $s[0]; SandboxText = $s[1] }
+}
+
+function Get-CheckTools($line) {
+    $builtin = 'cd', 'set', 'echo', 'call', 'exit', 'if', 'for', 'rem', 'pushd', 'popd', 'cmd', 'start',
+               'del', 'copy', 'move', 'type', 'dir', 'md', 'mkdir', 'rd', 'cls'
+    return @($line -split '&&|\|\||&|\|' | ForEach-Object { ($_.Trim() -split '\s+')[0] } |
+        Where-Object { $_ -and ($builtin -notcontains $_.ToLower()) } | Select-Object -Unique)
+}
+
+function Show-EnvProblem($what, $r) {
+    Write-Host "拒绝派写模式：$what 在本机能跑（退出码 $($r.Host)），在 Codex 沙箱里不行（退出码 $($r.Sandbox)）。" -ForegroundColor Red
+    Write-Host "沙箱输出（最后 15 行）：" -ForegroundColor DarkGray
+    ($r.SandboxText -split "`n" | Select-Object -Last 15) | ForEach-Object { Write-Host "  $_" }
+    Write-Host "多半是沙箱账号（组 CodexSandboxUsers）读不到某个安装目录：icacls <目录> 看有没有这个组；" -ForegroundColor Yellow
+    Write-Host "补权限：icacls <目录> /grant 'CodexSandboxUsers:(OI)(CI)RX'。修好前要派就加 -SkipCheck，验收时自己跑 check。" -ForegroundColor Yellow
+}
+
+# 返回 0 = 能派，4 = 环境问题
+function Invoke-PreCheck([bool]$Force) {
+    $check = Get-CheckCommand
+    if (-not $check) {
+        Write-Host "项目没配 check（.claude/codex-dispatch.json 的 check 字段），跳过前置检查。档位 2 的项目应该配上。" -ForegroundColor Yellow
+        return $(if ($Force) { 1 } else { 0 })
+    }
+    if ($check.Contains('"')) {
+        Write-Host "check 里不能有双引号（要整串交给 cmd /s /c）：$check" -ForegroundColor Red
+        return 1
+    }
+    $cfgToml = Join-Path $env:USERPROFILE '.codex\config.toml'
+    $stamp = if (Test-Path $cfgToml) { (Get-Item $cfgToml).LastWriteTimeUtc.Ticks } else { 0 }
+    $key = $root.ToLower()
+    $cache = @{}
+    if (Test-Path $checkCache) {
+        try { (Get-Content $checkCache -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $cache[$_.Name] = $_.Value } } catch { }
+    }
+    $hit = $cache[$key]
+    if (-not $Force -and $hit -and $hit.check -eq $check -and $hit.config -eq $stamp -and
+        ([DateTime]::UtcNow - [DateTime]::Parse($hit.at).ToUniversalTime()).TotalHours -lt $checkTtlHours) {
+        Write-Host "前置检查：$($hit.at) 已通过，24 小时内复用（-CheckOnly 可强制重跑）" -ForegroundColor DarkGray
+        return 0
+    }
+
+    Write-Host "前置检查：本机和 Codex 沙箱各跑一次 check：$check" -ForegroundColor Cyan
+    foreach ($t in Get-CheckTools $check) {
+        $r = Invoke-Both "$t --version"
+        if ($r.Host -eq 0 -and $r.Sandbox -ne 0) { Show-EnvProblem "工具 $t" $r; return 4 }
+    }
+    $r = Invoke-Both $check
+    if ($r.Host -eq 0 -and $r.Sandbox -ne 0) { Show-EnvProblem 'check' $r; return 4 }
+    if ($r.Host -ne 0) {
+        Write-Host "check 在本机也不通过（退出码 $($r.Host)），沙箱里 $($r.Sandbox)：测试本身是红的，不是环境问题，放行。" -ForegroundColor Yellow
+    } else {
+        Write-Host "前置检查通过：check 在 Codex 沙箱里能跑。" -ForegroundColor Green
+    }
+    $cache[$key] = @{ check = $check; config = $stamp; at = [DateTime]::UtcNow.ToString('o') }
+    New-Item -ItemType Directory -Force -Path (Split-Path $checkCache) | Out-Null
+    [System.IO.File]::WriteAllText($checkCache, ($cache | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    return 0
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Check') {
+    exit (Invoke-PreCheck $true)
+}
+if ($PSCmdlet.ParameterSetName -eq 'Task' -and $Mode -eq 'write') {
+    if ($SkipCheck) {
+        Write-Host "跳过前置检查（-SkipCheck）：验收时 Claude 必须自己跑 check，并记进派活日志。" -ForegroundColor Yellow
+    } else {
+        $pc = Invoke-PreCheck $false
+        if ($pc -ne 0) { exit $pc }
+    }
+}
 
 $raw = Join-Path $root '.codex-stream.jsonl'
 $last = Join-Path $root 'codex_report.md'
