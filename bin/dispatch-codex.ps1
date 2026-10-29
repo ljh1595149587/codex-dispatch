@@ -52,6 +52,11 @@ param(
     # 续接已有线程而非新开
     [string]$ResumeThread = '',
 
+    # 推理强度，原样传给 codex -c model_reasoning_effort=<值>。不传就按派活类型给默认值：
+    # 审查 high，其余 medium。核心代码、高风险改动手动传 high 或 ultra。
+    # 全局 config.toml 的值是 ultra 时会把边角情况挨个防一遍（「防御型编程」），派活不跟全局走。
+    [string]$Effort = '',
+
     # 写模式的受保护路径（逗号分隔的 glob，相对项目根，如 "tests/acceptance/*"）。
     # 验收测试由非实现方写好，Codex 为了让测试通过去改测试本身 = 不合格，脚本直接判退出码 3。
     [Parameter(ParameterSetName = 'Task')]
@@ -88,6 +93,14 @@ $target = Resolve-Path (Join-Path $root $Cwd)
 
 # 审查模式固定只读，不走 $Mode
 $sandbox = if ($Mode -eq 'read') { 'read-only' } else { 'workspace-write' }
+
+if (-not $Effort) { $Effort = if ($PSCmdlet.ParameterSetName -eq 'Review') { 'high' } else { 'medium' } }
+# 上游接受的值（10-29 传非法值时上游报错列出的）；ultra 是 CLI 自己认的别名，全局 config 里一直这么写、能跑
+$efforts = 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'
+if ($efforts -cnotcontains $Effort) {
+    Write-Host "-Effort 只能是 $($efforts -join ' / ')，收到：$Effort" -ForegroundColor Red
+    exit 1
+}
 
 # 开写权限前必须有干净的回滚点 —— 不采信「它不会乱改」，只信 git。
 if ($PSCmdlet.ParameterSetName -eq 'Task' -and $Mode -eq 'write') {
@@ -163,9 +176,9 @@ function Invoke-CodexOnce {
     [System.IO.File]::WriteAllText($pf, $Prompt, [System.Text.UTF8Encoding]::new($false))
 
     $a = if ($Thread) {
-        @('exec', 'resume', $Thread, '--json', '-s', $Sandbox, '-C', $target, '-o', $OutFile, '-')
+        @('-c', "model_reasoning_effort=$Effort", 'exec', 'resume', $Thread, '--json', '-s', $Sandbox, '-C', $target, '-o', $OutFile, '-')
     } else {
-        @('exec', '--json', '-s', $Sandbox, '-C', $target, '-o', $OutFile, '-')
+        @('-c', "model_reasoning_effort=$Effort", 'exec', '--json', '-s', $Sandbox, '-C', $target, '-o', $OutFile, '-')
     }
 
     $f = @((Join-Path $PSScriptRoot 'codex_stream.py'))
@@ -220,7 +233,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
     $r1 = Join-Path $root 'codex_review_find.md'
     $r2 = Join-Path $root 'codex_review_attack.md'
 
-    Write-Host "第 1 轮：找问题 | $Review" -ForegroundColor Cyan
+    Write-Host "第 1 轮：找问题 | 强度 $Effort | $Review" -ForegroundColor Cyan
     $p1 = @"
 审查这些文件：$Review
 
@@ -298,7 +311,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
 
 # ---- 普通任务 ----
 Remove-Item $raw -ErrorAction SilentlyContinue
-Write-Host "档位 $sandbox | 目录 $target" -ForegroundColor Cyan
+Write-Host "档位 $sandbox | 强度 $Effort | 目录 $target" -ForegroundColor Cyan
 $code = Invoke-Codex -Sandbox $sandbox -Prompt $Prompt -OutFile $last -Thread $ResumeThread
 
 $policy = Join-Path $PSScriptRoot 'dispatch_policy.py'

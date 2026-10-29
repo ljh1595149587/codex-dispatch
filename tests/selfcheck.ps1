@@ -136,10 +136,25 @@ if ($py) {
 
 Write-Host "`n[5] 参数契约" -ForegroundColor Cyan
 $sig = Get-Command $script
-foreach ($p in @('Mode', 'Prompt', 'Review', 'Round2Only', 'Root', 'Cwd', 'Budget', 'AnswerKey')) {
+foreach ($p in @('Mode', 'Prompt', 'Review', 'Round2Only', 'Root', 'Cwd', 'Budget', 'AnswerKey', 'Effort')) {
     Check "参数 -$p 存在" $sig.Parameters.ContainsKey($p)
 }
 Check "-Root 默认当前目录（脚本已脱离项目树）" ($sig.Parameters['Root'].Attributes.Count -ge 0)
+# 推理强度必须真的传给 codex：两条调用（新线程、续接）都要带。只查代码行，不算注释
+$effortArgs = (Get-Content $script -Encoding UTF8 |
+    Where-Object { $_ -notmatch '^\s*#' -and $_ -match '"model_reasoning_effort=\$Effort"' }).Count
+Check "两条 codex 调用都带 -c model_reasoning_effort（$effortArgs/2）" ($effortArgs -eq 2) "新线程和续接线程都要传"
+# 用临时 git 仓库：-Root 指向本 skill 目录会先被「派错树」守卫拦下，测不到这里
+$effTmp = Join-Path ([IO.Path]::GetTempPath()) ("dispatch-effort-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $effTmp -Force | Out-Null
+git -C $effTmp init -q 2>$null
+try {
+    $out = & powershell -NoProfile -File $script -Mode read -Prompt 'x' -Root $effTmp -Effort 'Bad Value' 2>&1 | Out-String
+    Check "-Effort 非法值在调用 Codex 前拒绝" ($LASTEXITCODE -eq 1 -and $out -match 'Effort' -and
+        -not (Test-Path (Join-Path $effTmp '.codex-stream.jsonl'))) $out.Trim()
+} finally {
+    Remove-Item $effTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host "`n[6] 自引用不变量" -ForegroundColor Cyan
 # 改名/搬家的成本全部落在硬编码的自引用上，且它们不报错、只静默失配。
