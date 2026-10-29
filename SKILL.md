@@ -72,6 +72,9 @@ $S = Split-Path (Split-Path $D -Parent) -Parent
 & $D -Mode write -Prompt "..." -Effort high               # 核心代码、高风险改动
 ```
 
+**只读派活的报告就是 Codex 的最后一条回复**（脚本存成 `codex_report.md`），prompt 里写「把报告作为最后一条回复输出」，别叫它写文件 ——
+只读沙箱写不了，报告会只剩一句「无法落盘」。脚本在 read 模式下会对「写进 / 保存到 xx.md」告警，并无条件在 prompt 末尾补上这条。
+
 **写模式前置检查**：项目 `.claude/codex-dispatch.json` 里配 `"check": "pnpm typecheck && pnpm test"`（不能含双引号）。
 派写模式前，脚本把它在本机和 Codex 沙箱（`codex sandbox -P :workspace`，不经模型、不花额度）里各跑一次：
 本机过、沙箱不过 = 环境问题，**退出码 4，不派**，并打出沙箱里的报错；两边都不过 = 测试本来就红，放行。

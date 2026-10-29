@@ -155,6 +155,24 @@ try {
 } finally {
     Remove-Item $effTmp -Recurse -Force -ErrorAction SilentlyContinue
 }
+# 只读派活叫 Codex 写文件 → 告警 + 无条件补收尾（10-29 报告没落盘那次）。从脚本 AST 取出函数离线测
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$null, [ref]$null)
+$fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $n.Name -eq 'Resolve-ReadPrompt' }, $true) | Select-Object -First 1
+Check "Resolve-ReadPrompt 存在" ($null -ne $fn)
+if ($fn) {
+    . ([scriptblock]::Create($fn.Extent.Text))
+    foreach ($p in @('报告写进 codex_report.md，≤4KB', '把结果保存到 `out/report.md`', 'write it to report.md', '结论存成 notes.txt')) {
+        Check "告警：$p" ((Resolve-ReadPrompt $p).Warn -ne '')
+    }
+    foreach ($p in @('读 docs/a.md 和 b.md，梳理数据流', '报告 ≤4KB，按模板填写', '列出 src/x.ts 的调用点')) {
+        Check "不误报：$p" ((Resolve-ReadPrompt $p).Warn -eq '')
+    }
+    $r = Resolve-ReadPrompt '原文'
+    Check "收尾无条件补上，原文在前" ($r.Prompt.StartsWith('原文') -and $r.Prompt -match '最后一条回复')
+    $hooked = (Get-Content $script -Encoding UTF8 | Where-Object { $_ -notmatch '^\s*#' -and $_ -match 'Resolve-ReadPrompt \$Prompt' }).Count
+    Check "普通任务的只读路径调用了 Resolve-ReadPrompt" ($hooked -eq 1)
+}
 
 Write-Host "`n[6] 自引用不变量" -ForegroundColor Cyan
 # 改名/搬家的成本全部落在硬编码的自引用上，且它们不报错、只静默失配。

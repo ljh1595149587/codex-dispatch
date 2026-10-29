@@ -257,6 +257,21 @@ if (-not $py) {
 }
 if (-not $py) { Write-Host "找不到 python（事件流过滤需要）" -ForegroundColor Red; exit 1 }
 
+# 只读派活的报告 = Codex 的最后一条回复（-o 存成 codex_report.md），它自己写不了文件。
+# 10-29 实测踩过：prompt 写了「报告写进 codex_report.md」，它就用 Set-Content 去写，被只读沙箱拒，
+# 最后一条回复只剩一句「无法落盘」，6KB 正文只能从事件流里那条写文件命令中救回来。
+# 所以：prompt 像是叫它写文件时告警；并且无条件补一段收尾，写错了也不丢报告。
+function Resolve-ReadPrompt([string]$p) {
+    $pattern = '(写进|写入|写到|保存到|保存为|存到|存成|落盘到|输出到|write\s+(it\s+)?(in)?to|save\s+(it\s+)?(as|to))\s*[`"''“]?[\w./\\-]+\.(md|txt|json|csv|log)'
+    $m = [regex]::Match($p, $pattern, 'IgnoreCase')
+    $footer = "`n`n---`n（派活脚本附加）你在只读沙箱里，任何写文件的命令都会失败，不要尝试写文件。" +
+        "把完整报告作为你的最后一条回复直接输出，脚本会把它存成 codex_report.md。上面如有「写进某文件」的说法，一律按这条理解。"
+    [pscustomobject]@{
+        Prompt = $p + $footer
+        Warn   = if ($m.Success) { $m.Value } else { '' }
+    }
+}
+
 function Invoke-Codex {
     param($Sandbox, $Prompt, $OutFile, $Thread = '', $Retries = 3)
 
@@ -430,6 +445,14 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
 # ---- 普通任务 ----
 Remove-Item $raw -ErrorAction SilentlyContinue
 Write-Host "档位 $sandbox | 强度 $Effort | 目录 $target" -ForegroundColor Cyan
+if ($Mode -eq 'read') {
+    $rp = Resolve-ReadPrompt $Prompt
+    if ($rp.Warn) {
+        Write-Host "告警：只读派活的 prompt 叫 Codex 写文件（「$($rp.Warn)」）。它在只读沙箱里写不了；" -ForegroundColor Yellow
+        Write-Host "      已在 prompt 末尾补上「把报告作为最后一条回复输出」。下次直接这么写。" -ForegroundColor Yellow
+    }
+    $Prompt = $rp.Prompt
+}
 $code = Invoke-Codex -Sandbox $sandbox -Prompt $Prompt -OutFile $last -Thread $ResumeThread
 
 $policy = Join-Path $PSScriptRoot 'dispatch_policy.py'
