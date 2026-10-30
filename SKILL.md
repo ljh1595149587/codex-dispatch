@@ -72,6 +72,9 @@ $S = Split-Path (Split-Path $D -Parent) -Parent
 & $D -Mode write -Prompt "..." -Effort high               # 核心代码、高风险改动
 ```
 
+**退出码 5 = Codex 没产出报告**：脚本会打出 codex 的 stderr 尾部，看那里的真实原因（参数错误、线程不存在等）。
+「上游没容量 / 限流」会自动重试，不会走到 5。续接线程（`-ResumeThread`）用 `-c sandbox_mode=`，`exec resume` 不认 `-s` / `-C`。
+
 **只读派活的报告就是 Codex 的最后一条回复**（脚本存成 `codex_report.md`），prompt 里写「把报告作为最后一条回复输出」，别叫它写文件 ——
 只读沙箱写不了，报告会只剩一句「无法落盘」。脚本在 read 模式下会对「写进 / 保存到 xx.md」告警，并无条件在 prompt 末尾补上这条。
 

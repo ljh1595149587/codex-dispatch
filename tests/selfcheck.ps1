@@ -174,6 +174,44 @@ if ($fn) {
     Check "普通任务的只读路径调用了 Resolve-ReadPrompt" ($hooked -eq 1)
 }
 
+# 10-30 三个 bug：codex 版本选择、续接参数、没报告却退出 0。注意 -match 不分大小写，'-C' 会匹配合法的 '-c'，要用 -cnotmatch
+foreach ($name in 'Get-CodexVersionKey', 'Select-NewestCodex') {
+    $f = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true) | Select-Object -First 1
+    Check "$name 存在" ($null -ne $f)
+    if ($f) { . ([scriptblock]::Create($f.Extent.Text)) }
+}
+if (Get-Command Select-NewestCodex -ErrorAction SilentlyContinue) {
+    $pick = Select-NewestCodex @(
+        @{ Path = 'desktop-old'; VersionText = 'codex-cli 0.163.0-alpha.11.1' },
+        @{ Path = 'npm-new'; VersionText = 'codex-cli 0.165.0' },
+        @{ Path = 'npm-pre'; VersionText = 'codex-cli 0.165.0-alpha.2' },
+        @{ Path = 'broken'; VersionText = '' })
+    Check "codex 按版本号取最新正式版（0.165.0 > 0.165.0-alpha > 0.163-alpha）" ($pick -eq 'npm-new') "选中 $pick"
+    Check "没有可用版本时返回空" ($null -eq (Select-NewestCodex @(@{ Path = 'x'; VersionText = 'garbage' })))
+}
+$lines = Get-Content $script -Encoding UTF8 | Where-Object { $_ -notmatch '^\s*#' }
+$resume = $lines | Where-Object { $_ -match "'resume'" }
+Check "续接用 -c sandbox_mode，不传 exec resume 不认的 -s / -C" ($resume -and ($resume -match 'sandbox_mode=') -and ($resume -cnotmatch "'-s'|'-C'")) ($resume -join ' ')
+Check "不再写死 codex 的哈希目录" (-not ($lines -match 'Codex\bin\[0-9a-f]{16}'))
+Check "codex 的 stderr 不再丢弃（2>NUL）" (-not ($lines | Where-Object { $_ -match '\$cmdLine' -and $_ -match '2>NUL' }))
+$noReport = [regex]::Match(($lines -join "`n"), "if \(-not \(Test-Path \`$last\)\) \{[^}]*exit 5", 'Singleline').Success
+Check "普通任务没出报告时退出码 5（不再报成功）" $noReport
+$fb = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-UpstreamBusy' }, $true) | Select-Object -First 1
+Check "Test-UpstreamBusy 存在" ($null -ne $fb)
+if ($fb) {
+    . ([scriptblock]::Create($fb.Extent.Text))
+    $t1 = Join-Path ([IO.Path]::GetTempPath()) 'cx-busy-1.txt'; $t2 = Join-Path ([IO.Path]::GetTempPath()) 'cx-busy-2.txt'
+    [IO.File]::WriteAllText($t1, ''); Remove-Item $t2 -ErrorAction SilentlyContinue
+    Check "空事件流不算「上游没容量」（10-30 误报两次的根因）" (-not (Test-UpstreamBusy $t1 $t2))
+    [IO.File]::WriteAllText($t2, 'Error: thread/resume failed: no rollout found')
+    Check "参数 / 线程错误不算「上游没容量」" (-not (Test-UpstreamBusy $t1 $t2))
+    [IO.File]::WriteAllText($t1, '{"type":"error","message":"Selected model is at capacity."}')
+    Check "事件流里的 at capacity 照样识别" (Test-UpstreamBusy $t1 $t2)
+    [IO.File]::WriteAllText($t1, ''); [IO.File]::WriteAllText($t2, 'stream disconnected: Our servers are currently overloaded')
+    Check "stderr 里的 overloaded 也识别" (Test-UpstreamBusy $t1 $t2)
+    Remove-Item $t1, $t2 -ErrorAction SilentlyContinue
+}
+
 Write-Host "`n[6] 自引用不变量" -ForegroundColor Cyan
 # 改名/搬家的成本全部落在硬编码的自引用上，且它们不报错、只静默失配。
 # 上一次搬家（d:\work\ → skills 目录）在 settings.local.json 里留下约 20 条

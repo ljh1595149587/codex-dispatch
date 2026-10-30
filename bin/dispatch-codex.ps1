@@ -128,13 +128,31 @@ if ($PSCmdlet.ParameterSetName -eq 'Task' -and $Mode -eq 'write') {
 # C:\nvm4w\nodejs\codex.ps1 —— 那个包装脚本内部是 `$input | & node ...`，
 # 它自己要读 stdin，任何喂给它的东西都会让 node 停在
 # "Reading additional input from stdin..."。绕开它。
-$codex = "$env:LOCALAPPDATA\OpenAI\Codex\bin\39633208fb6e0c47\codex.exe"
-if (-not (Test-Path $codex)) {
-    $found = Get-ChildItem "$env:LOCALAPPDATA\OpenAI\Codex\bin" -Recurse -Filter 'codex.exe' -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty FullName
-    if ($found) { $codex = $found }
+# 原生 exe 有两个来源：Codex 桌面版装的（目录名是哈希，随升级变），以及 npm 包自带的
+# （node_modules\@openai\codex-win32-x64\vendor\...\codex.exe）。按版本号取最新的。
+# 10-30 实测：原来写死的哈希目录已不存在，兜底取到桌面版的 0.163-alpha，而 npm 那份已是 0.165。
+function Get-CodexVersionKey([string]$text) {
+    if ($text -notmatch '(\d+)\.(\d+)\.(\d+)(-\S+)?') { return $null }
+    # 同号的正式版排在预发布版之后
+    [pscustomobject]@{ Version = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"; Release = [int](-not $Matches[4]) }
 }
-if (-not (Test-Path $codex)) { Write-Host "找不到 codex 原生 exe" -ForegroundColor Red; exit 1 }
+function Select-NewestCodex($items) {
+    # items: @{ Path; VersionText }，返回版本最高的 Path；没有可用的返回 $null
+    $items | ForEach-Object {
+        $k = Get-CodexVersionKey $_.VersionText
+        if ($k) { [pscustomobject]@{ Path = $_.Path; Version = $k.Version; Release = $k.Release } }
+    } | Sort-Object Version, Release -Descending | Select-Object -First 1 -ExpandProperty Path
+}
+$exes = @(Get-ChildItem "$env:LOCALAPPDATA\OpenAI\Codex\bin" -Recurse -Filter 'codex.exe' -ErrorAction SilentlyContinue)
+$npmCodex = Get-Command codex -ErrorAction SilentlyContinue
+if ($npmCodex) {
+    $exes += @(Get-ChildItem (Join-Path (Split-Path $npmCodex.Source) 'node_modules\@openai') -Recurse -Filter 'codex.exe' -ErrorAction SilentlyContinue)
+}
+$codex = Select-NewestCodex ($exes | ForEach-Object {
+    $v = try { (& $_.FullName --version) -join ' ' } catch { '' }
+    @{ Path = $_.FullName; VersionText = $v }
+})
+if (-not $codex) { Write-Host "找不到 codex 原生 exe（桌面版和 npm 包里都没有）" -ForegroundColor Red; exit 1 }
 
 # ---------------------------------------------------------------- 写模式前置检查
 # Codex 的 Windows 沙箱以单独的本机账号运行（codexsandboxoffline，组 CodexSandboxUsers）。
@@ -248,6 +266,29 @@ if ($PSCmdlet.ParameterSetName -eq 'Task' -and $Mode -eq 'write') {
 
 $raw = Join-Path $root '.codex-stream.jsonl'
 $last = Join-Path $root 'codex_report.md'
+# codex 的 stderr 原来直接丢弃（2>NUL），参数错误、启动失败全被吞掉，只剩「事件流为空」。
+# 落到项目外的临时文件：不进工作树（写模式要求干净），没出报告时把尾部打出来
+$errFile = Join-Path ([IO.Path]::GetTempPath()) "codex-dispatch-stderr-$PID.txt"
+
+# 上游没容量 / 限流：看事件流和 stderr。必须先转成字符串 —— 空文件的 Get-Content -Raw 不是 ''，
+# 对它做 -notmatch 得到空集合（假），空事件流就被当成「没容量」去重试。
+# 10-30 实测：续接参数错误时事件流为空，被这样误报成「上游没容量」两次，误导了一轮判断。
+function Test-UpstreamBusy($streamPath, $stderrPath) {
+    $text = ''
+    foreach ($f in @($streamPath, $stderrPath)) {
+        if ($f -and (Test-Path $f)) { $text += [string](Get-Content $f -Raw -Encoding UTF8) }
+    }
+    return [bool]($text -match 'at capacity|rate limit|overloaded')
+}
+
+function Show-NoReport($what, $code) {
+    Write-Host "`n$what 没有产出报告（codex 进程退出码 $code）。" -ForegroundColor Red
+    if (Test-Path $errFile) {
+        $tail = Get-Content $errFile -Encoding UTF8 -Tail 15 | Where-Object { $_ -notmatch 'unrecognized configuration|is ignored\.' }
+        if ($tail) { Write-Host 'codex stderr 尾部：' -ForegroundColor Yellow; $tail | ForEach-Object { Write-Host "  $_" } }
+    }
+    Write-Host "事件流：$raw" -ForegroundColor DarkGray
+}
 
 $py = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $py) {
@@ -280,14 +321,13 @@ function Invoke-Codex {
 
     for ($i = 1; $i -le $Retries; $i++) {
         # 每次重试前清流：否则会读到上一轮残留的 at capacity 而误判
-        Remove-Item $raw -ErrorAction SilentlyContinue
+        Remove-Item $raw, $errFile -ErrorAction SilentlyContinue
         $code = Invoke-CodexOnce -Sandbox $Sandbox -Prompt $Prompt -OutFile $OutFile -Thread $Thread
         if (Test-Path $OutFile) { return $code }
 
         # 「上游没容量」是间歇性的，实测反复出现（5 次）。自动重试，
         # 不要让调用方以为是自己的 prompt 有问题。
-        $tail = if (Test-Path $raw) { Get-Content $raw -Raw } else { '' }
-        if ($tail -notmatch 'at capacity|rate limit') { return $code }
+        if (-not (Test-UpstreamBusy $raw $errFile)) { return $code }
         if ($i -lt $Retries) {
             $wait = 20 * $i
             Write-Host "上游没容量，${wait}s 后重试（$i/$Retries）" -ForegroundColor Yellow
@@ -308,8 +348,10 @@ function Invoke-CodexOnce {
     $pf = Join-Path $root '.codex-prompt.txt'
     [System.IO.File]::WriteAllText($pf, $Prompt, [System.Text.UTF8Encoding]::new($false))
 
+    # exec resume 不认 -s / -C（0.163、0.165 实测：参数错误只进 stderr，事件流为空，看起来像「没产出」）。
+    # 沙箱改用 -c sandbox_mode=，工作目录在 cmd 里 cd /d 过去
     $a = if ($Thread) {
-        @('-c', "model_reasoning_effort=$Effort", 'exec', 'resume', $Thread, '--json', '-s', $Sandbox, '-C', $target, '-o', $OutFile, '-')
+        @('-c', "model_reasoning_effort=$Effort", '-c', "sandbox_mode=$Sandbox", 'exec', 'resume', $Thread, '--json', '-o', $OutFile, '-')
     } else {
         @('-c', "model_reasoning_effort=$Effort", 'exec', '--json', '-s', $Sandbox, '-C', $target, '-o', $OutFile, '-')
     }
@@ -332,7 +374,8 @@ function Invoke-CodexOnce {
     # UTF-8 的多字节序列被按 GBK 拆开，非 ASCII 成对损坏。原先用 Tee-Object
     # 落盘，存下来的 JSONL 有 32 处 U+FFFD、整行解析失败，事后复查时证据已经烂了。
     # 报告文件由 codex 自己写，不受影响，所以这个损坏只在「回头查事件流」时才暴露。
-    $cmdLine = '"' + $codex + '" ' + $argLine + ' <"' + $pf + '" 2>NUL | "' + $py + '" -u ' + $fLine
+    $cd = if ($Thread) { 'cd /d "' + $target + '" && ' } else { '' }
+    $cmdLine = $cd + '"' + $codex + '" ' + $argLine + ' <"' + $pf + '" 2>"' + $errFile + '" | "' + $py + '" -u ' + $fLine
 
     # 不要在 PowerShell 层写 `2>&1` —— PS 5.1 会把原生 exe 的每行 stderr 包成
     # NativeCommandError，叠加 $ErrorActionPreference='Stop' 会让一行无害提示
@@ -385,13 +428,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
 
     if (-not (Test-Path $r1)) {
         # 区分「任务失败」和「上游没容量」—— 后者重试即可，别让调用方去改 prompt
-        $tail = if (Test-Path $raw) { Get-Content $raw -Raw } else { '' }
-        if ($tail -match 'at capacity|rate limit') {
+        if (Test-UpstreamBusy $raw $errFile) {
             Write-Host "第 1 轮失败：上游模型没容量，与任务无关。稍后重跑同一条命令即可。" -ForegroundColor Yellow
         } else {
-            Write-Host "第 1 轮没有产出报告，中止。详见 $raw" -ForegroundColor Red
+            Show-NoReport '第 1 轮' $code
         }
-        exit 1
+        exit 5
     }
 
     Write-Host "`n第 2 轮：独立复核（新线程）" -ForegroundColor Cyan
@@ -474,9 +516,12 @@ if ($Mode -eq 'write') {
     & $py $policy --cwd $root record-codex --mode read | Out-Null
 }
 
-if (Test-Path $last) {
-    Write-Host "`n报告：$last" -ForegroundColor Green
+if (-not (Test-Path $last)) {
+    # 10-30 实测：续接参数错误时 codex 一行没写、事件流为空，脚本却退出 0，被当成「上游没容量」误判了一轮
+    Show-NoReport 'Codex' $code
+    exit 5
 }
+Write-Host "`n报告：$last" -ForegroundColor Green
 Write-Host "原始事件流：$raw"
 Write-Host "验收完记得往 docs/dispatch-log.md 追一条。" -ForegroundColor DarkGray
 
