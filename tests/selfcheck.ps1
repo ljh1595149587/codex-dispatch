@@ -316,5 +316,51 @@ if (-not $py) {
     Check "单测全过（$ran 条）" ($LASTEXITCODE -eq 0) ($out.Trim() -split "`n" | Select-Object -Last 12 | Out-String)
 }
 
+Write-Host "`n[9] 两轮审查：第 1 轮事件流另存 + 中间说明（11-04）" -ForegroundColor Cyan
+# 两轮共用 .codex-stream.jsonl，第 2 轮开跑先删再写；第 1 轮复现了却没进表格的问题随之丢失（M2、11-04 两次）
+$all = (Get-Content $script -Encoding UTF8) -join "`n"
+$copyAt = $all.IndexOf('Copy-Item $raw $raw1')
+$r1At = $all.IndexOf("Invoke-Codex -Sandbox 'read-only' -OutFile `$r1")
+$r2At = $all.IndexOf("Invoke-Codex -Sandbox 'read-only' -OutFile `$r2")
+Check "第 1 轮跑完、第 2 轮开跑前另存事件流" ($r1At -ge 0 -and $copyAt -gt $r1At -and $copyAt -lt $r2At) "r1=$r1At copy=$copyAt r2=$r2At"
+$fx = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-LocalExclude' }, $true) | Select-Object -First 1
+Check "Add-LocalExclude 存在" ($null -ne $fx)
+$exTmp = Join-Path ([IO.Path]::GetTempPath()) "cdx-exclude-$PID"
+try {
+    if ($fx) {
+        . ([scriptblock]::Create($fx.Extent.Text))
+        New-Item -ItemType Directory -Force $exTmp | Out-Null
+        Add-LocalExclude $exTmp @('a.jsonl')   # 还不是 git 仓库：不报错、不建文件
+        Check "不是 git 仓库时静默跳过" (-not (Test-Path (Join-Path $exTmp '.git')))
+        git -C $exTmp init -q 2>$null
+        [IO.File]::WriteAllText((Join-Path $exTmp '.gitignore'), "covered.md`n")
+        $names = @('.codex-stream-find.jsonl', 'codex_review_find.notes.md', 'covered.md')
+        Add-LocalExclude $exTmp $names
+        Add-LocalExclude $exTmp $names
+        $exFile = Join-Path $exTmp '.git\info\exclude'
+        $exLines = Get-Content $exFile -Encoding UTF8
+        $ignored = @($names | Where-Object { git -C $exTmp check-ignore -q --no-index -- $_ 2>$null; $LASTEXITCODE -eq 0 })
+        Check "新产出物都被忽略（不会弄脏工作树、拦下写模式）" ($ignored.Count -eq 3) "已忽略：$($ignored -join ', ')"
+        Check "重复调用不重复追加" (@($exLines | Where-Object { $_ -eq '.codex-stream-find.jsonl' }).Count -eq 1)
+        Check ".gitignore 已覆盖的名字不再补" (@($exLines | Where-Object { $_ -eq 'covered.md' }).Count -eq 0)
+    }
+    if ($py) {
+        $sj = Join-Path $exTmp 's.jsonl'; $sn = Join-Path $exTmp 'n.md'
+        $lines = @(
+            ([char]0xFEFF + '{"type":"thread.started","thread_id":"t1"}'),
+            '{"type":"item.completed","item":{"type":"agent_message","text":"复现了：停用用户仍能登录（表格里没写）"}}',
+            '{"type":"item.completed","item":{"type":"command_execution","command":["powershell.exe","-Command","pnpm test"],"exit_code":1}}',
+            '{"type":"item.completed","item":{"type":"command_execution","command":"git diff HEAD","exit_code":0}}',
+            '坏行')
+        [IO.File]::WriteAllText($sj, ($lines -join "`n"), [Text.UTF8Encoding]::new($false))
+        & cmd.exe /c "`"$py`" `"$(Join-Path $repo 'bin\codex_stream.py')`" --notes `"$sj`" `"$sn`" >NUL 2>&1"
+        $nt = if (Test-Path $sn) { [IO.File]::ReadAllText($sn, [Text.UTF8Encoding]::new($false)) } else { '' }
+        Check "中间说明抽出 agent_message 全文（中文原样）" ($nt -match '停用用户仍能登录') $nt
+        Check "命令清单标出非 0 退出码、只留真正的命令" ($nt -match '\[1\] !1 pnpm test' -and $nt -match '\[2\] git diff HEAD') $nt
+    }
+} finally {
+    Remove-Item $exTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "`n通过 $pass，失败 $fail`n" -ForegroundColor $(if ($fail) { 'Red' } else { 'Green' })
 exit $(if ($fail) { 1 } else { 0 })

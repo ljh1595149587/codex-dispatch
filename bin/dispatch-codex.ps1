@@ -290,6 +290,26 @@ function Show-NoReport($what, $code) {
     Write-Host "事件流：$raw" -ForegroundColor DarkGray
 }
 
+# 新加的产出物没进项目 .gitignore 时，工作树会变「不干净」，下次写模式派活被拦。
+# 不要求每个项目改 .gitignore：没被忽略的名字补进本机的 .git/info/exclude（只对这份仓库生效、不进提交）。
+# worktree 里 .git 是文件，用 rev-parse --git-path 找真正的 exclude 路径。
+function Add-LocalExclude([string]$repo, [string[]]$names) {
+    # 不在 git 仓库时 git 会往 stderr 写 fatal；PS 5.1 + Stop 会把它变成终止错误
+    $ErrorActionPreference = 'Continue'
+    $null = & git -C $repo rev-parse --git-dir 2>$null
+    if ($LASTEXITCODE -ne 0) { return }
+    $ex = (& git -C $repo rev-parse --git-path info/exclude 2>$null | Select-Object -First 1)
+    if (-not $ex) { return }
+    if (-not [IO.Path]::IsPathRooted($ex)) { $ex = Join-Path $repo $ex }
+    foreach ($n in $names) {
+        & git -C $repo check-ignore -q --no-index -- $n 2>$null
+        if ($LASTEXITCODE -eq 0) { continue }
+        New-Item -ItemType Directory -Force (Split-Path $ex) | Out-Null
+        $prefix = if ((Test-Path $ex) -and -not ([IO.File]::ReadAllText($ex)).EndsWith("`n") -and (Get-Item $ex).Length -gt 0) { "`n" } else { '' }
+        [IO.File]::AppendAllText($ex, "$prefix$n`n", [Text.UTF8Encoding]::new($false))
+    }
+}
+
 $py = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $py) {
     $py = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python" -Directory -ErrorAction SilentlyContinue |
@@ -408,6 +428,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
 
     $r1 = Join-Path $root 'codex_review_find.md'
     $r2 = Join-Path $root 'codex_review_attack.md'
+    # 第 1 轮的事件流另存一份：两轮共用 $raw，第 2 轮开跑时会删掉重写，
+    # 第 1 轮复现出来却没写进表格的问题就没了（M1 那次表外多出 2 条真 bug；M2、11-04 两次被覆盖）。
+    # 另抽一份中间说明给审查者先读，原始事件流只在有疑点时 grep。
+    $raw1 = Join-Path $root '.codex-stream-find.jsonl'
+    $notes1 = Join-Path $root 'codex_review_find.notes.md'
+    Add-LocalExclude $root @('.codex-stream-find.jsonl', 'codex_review_find.notes.md')
 
     Write-Host "第 1 轮：找问题 | 强度 $Effort | $Review" -ForegroundColor Cyan
     $p1 = @"
@@ -423,7 +449,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
         }
         Write-Host "跳过第 1 轮，复用 $r1" -ForegroundColor DarkGray
     } else {
+        Remove-Item $raw1, $notes1 -ErrorAction SilentlyContinue
         $code = Invoke-Codex -Sandbox 'read-only' -OutFile $r1 -Prompt $p1
+        # 失败也存：中途断掉时能看到它做到了哪一步
+        if (Test-Path $raw) {
+            Copy-Item $raw $raw1 -Force
+            & $py (Join-Path $PSScriptRoot 'codex_stream.py') --notes $raw1 $notes1 | Out-Null
+        }
     }
 
     if (-not (Test-Path $r1)) {
@@ -479,7 +511,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
     Write-Host "`n第 1 轮 $r1" -ForegroundColor Green
     Write-Host "第 2 轮 $r2" -ForegroundColor Green
     Write-Host "两份对照读：只采信第 2 轮判成立的。" -ForegroundColor DarkGray
-    Write-Host "原始事件流：$raw"
+    if (Test-Path $notes1) {
+        Write-Host "第 1 轮中间说明 $notes1（先读这份：表外复现的问题在这里）" -ForegroundColor Green
+    }
+    Write-Host "第 1 轮事件流：$raw1"
+    Write-Host "第 2 轮事件流：$raw"
     & $py (Join-Path $PSScriptRoot 'dispatch_policy.py') --cwd $root record-codex --mode read | Out-Null
     exit $code
 }

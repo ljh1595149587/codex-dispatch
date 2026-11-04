@@ -43,7 +43,15 @@ codex_review_find.md
 codex_review_attack.md
 .codex-stream.jsonl
 .codex-prompt.txt
+.codex-stream-find.jsonl
+codex_review_find.notes.md
 ```
+
+后两个是两轮审查第 1 轮的产物（11-04 加）：两轮共用 `.codex-stream.jsonl`，第 2 轮开跑时会删掉重写，
+第 1 轮复现出来却没写进表格的问题就没了（M1 那次表外多出 2 条真 bug，之后两次被覆盖）。
+所以第 1 轮跑完先另存 `.codex-stream-find.jsonl`，再抽一份 `codex_review_find.notes.md`（Codex 的中间说明全文 +
+跑过的命令清单，非 0 退出码标 `!`）。**读审查结果先读这份说明**，有疑点再 grep 原始事件流 —— 整份事件流太贵。
+项目 .gitignore 没覆盖这两个名字时，脚本自动补进本机 `.git/info/exclude`，不会弄脏工作树、拦下写模式派活。
 
 ## 派活档位、Claude 额度与钩子
 

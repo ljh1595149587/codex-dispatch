@@ -32,13 +32,54 @@ def strip_shell_wrapper(cmd):
     return str(cmd)
 
 
+def extract_notes(src, dst):
+    """从已落盘的事件流抽出 Codex 的中间说明（agent_message 全文）和跑过的命令清单。
+
+    两轮审查的第 1 轮会读代码、跑命令、试着复现，复现出来却没写进最终表格的问题只留在
+    事件流里。原始事件流动辄几百 KB，整份读太贵 —— 这份摘要是给审查者先读的。
+    """
+    notes, cmds = [], []
+    with io.open(src, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.lstrip("﻿").strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            m = d.get("msg") or d
+            if m.get("type") != "item.completed":
+                continue
+            item = m.get("item") or {}
+            if item.get("type") == "agent_message" and item.get("text"):
+                notes.append(item["text"].strip())
+            elif item.get("type") == "command_execution":
+                cmds.append((item.get("exit_code"), truncate(strip_shell_wrapper(item.get("command")), 200)))
+    with io.open(dst, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# 第 1 轮的中间说明（从事件流抽取，原始事件流见 .codex-stream-find.jsonl）\n\n")
+        for i, n in enumerate(notes, 1):
+            f.write("## 说明 %d\n\n%s\n\n" % (i, n))
+        f.write("## 跑过的命令（%d 条，退出码非 0 的标 !）\n\n" % len(cmds))
+        for i, (code, c) in enumerate(cmds, 1):
+            f.write("- [%d]%s %s\n" % (i, " !%s" % code if code not in (0, None) else "", c))
+    return len(notes), len(cmds)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--budget", type=int, default=0,
                     help="token 预算，超出时输出告警行（0 表示不检查）")
     ap.add_argument("--tee", default="",
                     help="把原始事件行另存一份到此路径（UTF-8）")
+    ap.add_argument("--notes", nargs=2, metavar=("STREAM", "OUT"),
+                    help="不过滤 stdin：从已落盘的事件流 STREAM 抽出中间说明和命令清单，写到 OUT")
     args = ap.parse_args()
+
+    if args.notes:
+        n, c = extract_notes(args.notes[0], args.notes[1])
+        print("抽出 %d 段说明、%d 条命令" % (n, c))
+        return
 
     # Windows 默认 GBK，中文命令/消息会编码失败。强制 UTF-8。
     out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
