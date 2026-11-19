@@ -320,8 +320,8 @@ Write-Host "`n[9] 两轮审查：第 1 轮事件流另存 + 中间说明（11-04
 # 两轮共用 .codex-stream.jsonl，第 2 轮开跑先删再写；第 1 轮复现了却没进表格的问题随之丢失（M2、11-04 两次）
 $all = (Get-Content $script -Encoding UTF8) -join "`n"
 $copyAt = $all.IndexOf('Copy-Item $raw $raw1')
-$r1At = $all.IndexOf("Invoke-Codex -Sandbox 'read-only' -OutFile `$r1")
-$r2At = $all.IndexOf("Invoke-Codex -Sandbox 'read-only' -OutFile `$r2")
+$r1At = $all.IndexOf("Invoke-Codex -Sandbox `$reviewSandbox -OutFile `$r1")
+$r2At = $all.IndexOf("Invoke-Codex -Sandbox `$reviewSandbox -OutFile `$r2")
 Check "第 1 轮跑完、第 2 轮开跑前另存事件流" ($r1At -ge 0 -and $copyAt -gt $r1At -and $copyAt -lt $r2At) "r1=$r1At copy=$copyAt r2=$r2At"
 $fx = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Add-LocalExclude' }, $true) | Select-Object -First 1
 Check "Add-LocalExclude 存在" ($null -ne $fx)
@@ -360,6 +360,33 @@ try {
     }
 } finally {
     Remove-Item $exTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "`n[10] 审查可写、只许动测试文件（11-19）" -ForegroundColor Cyan
+# 审查写死只读时 Codex 跑不了测试（EPERM），第 2 层落回实现方自己跑，和 docs/levels.md §4 相反
+$scopeAt = @([regex]::Matches($all, "Assert-ReviewScope '第 [12] 轮'") | ForEach-Object { $_.Index })
+Check "两轮各自跑完就查改动范围" ($scopeAt.Count -eq 2 -and $scopeAt[0] -gt $r1At -and $scopeAt[0] -lt $r2At -and $scopeAt[1] -gt $r2At) "r1=$r1At r2=$r2At scope=$($scopeAt -join ',')"
+Check "只读时明说别试测试（EPERM）" ($all -match '不要尝试运行它们' -and $all -match 'EPERM')
+Check "可写时 prompt 写明可动的 glob" ($all -match '只能新增或修改匹配这些 glob 的文件：\$testGlobs')
+$fg = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-TestGlobs' }, $true) | Select-Object -First 1
+Check "Get-TestGlobs 存在" ($null -ne $fg)
+$tgTmp = Join-Path ([IO.Path]::GetTempPath()) "cdx-tests-$PID"
+try {
+    if ($fg) {
+        . ([scriptblock]::Create($fg.Extent.Text))
+        $root = $tgTmp
+        New-Item -ItemType Directory -Force (Join-Path $tgTmp '.claude') | Out-Null
+        $cfgF = Join-Path $tgTmp '.claude\codex-dispatch.json'
+        Check "没配置文件返回空" ((Get-TestGlobs) -eq '')
+        [IO.File]::WriteAllText($cfgF, '{"tests": ["**/*.test.ts", "tests/*"]}', [Text.UTF8Encoding]::new($false))
+        Check "数组拼成逗号串" ((Get-TestGlobs) -eq '**/*.test.ts,tests/*') (Get-TestGlobs)
+        [IO.File]::WriteAllText($cfgF, '{"tests": " a/* , b/* "}', [Text.UTF8Encoding]::new($false))
+        Check "字符串去空白" ((Get-TestGlobs) -eq 'a/*,b/*') (Get-TestGlobs)
+        [IO.File]::WriteAllText($cfgF, '{"check": "x"}', [Text.UTF8Encoding]::new($false))
+        Check "没配 tests 返回空（退回只读）" ((Get-TestGlobs) -eq '')
+    }
+} finally {
+    Remove-Item $tgTmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "`n通过 $pass，失败 $fail`n" -ForegroundColor $(if ($fail) { 'Red' } else { 'Green' })

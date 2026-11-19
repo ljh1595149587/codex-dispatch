@@ -40,6 +40,11 @@ param(
     [Parameter(ParameterSetName = 'Review')]
     [string]$AnswerKey = 'docs/memory/',
 
+    # 审查默认走可写沙箱、只许动测试文件（项目配置 tests），让验收方自己写边界测试、跑 check。
+    # 这个开关强制退回只读（只读代码判断，测试由派活方跑）。
+    [Parameter(ParameterSetName = 'Review')]
+    [switch]$ReviewReadOnly,
+
     # 项目根。脚本已挪出项目树，不能再由 $PSScriptRoot 推断。
     [string]$Root = '.',
 
@@ -172,6 +177,15 @@ function Get-CheckCommand {
     try { $c = (Get-Content $cfg -Raw -Encoding UTF8 | ConvertFrom-Json).check } catch { return '' }
     if ($c -is [string]) { return $c.Trim() }
     return ''
+}
+
+# 审查方可以动的测试文件：项目配置 "tests"，字符串（逗号分隔）或数组，glob 相对项目根（fnmatch，* 跨目录）
+function Get-TestGlobs {
+    $cfg = Join-Path $root '.claude\codex-dispatch.json'
+    if (-not (Test-Path $cfg)) { return '' }
+    try { $t = (Get-Content $cfg -Raw -Encoding UTF8 | ConvertFrom-Json).tests } catch { return '' }
+    if ($null -eq $t) { return '' }
+    return ((@($t) | ForEach-Object { "$_".Split(',') } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ',')
 }
 
 # 本机和沙箱各跑一次同一行命令，返回两边的退出码和沙箱输出
@@ -420,6 +434,19 @@ function Invoke-CodexOnce {
     return $LASTEXITCODE
 }
 
+# 可写审查跑完一轮就查：测试文件以外有改动 = 不合格（退出码 3，同 -Protect），不进下一轮
+function Assert-ReviewScope($round) {
+    if ($reviewSandbox -ne 'workspace-write') { return }
+    $bad = @(& $py $policyPy check-only-in --root $root --globs $testGlobs)
+    # 2 = git 出错、判断不了：同样不放行，进下一轮或交差前要人看
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`n不合格：$round 改了测试文件（$testGlobs）以外的文件，或改动范围判断不了：" -ForegroundColor Red
+        $bad | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+        Write-Host "审查方只许写测试。git diff 看清后回滚这些文件（git checkout -- <文件>，新文件删掉），记进派活日志。" -ForegroundColor Yellow
+        exit 3
+    }
+}
+
 # ---- 审查模式：找 → 攻 ----
 # 第二轮必须开新线程，不能用 resume。同一上下文里「推翻自己」是走过场 ——
 # 它已经为那些结论背过书了。新线程只喂表格、不喂推理过程，它才会真去查代码。
@@ -433,15 +460,70 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
     # 另抽一份中间说明给审查者先读，原始事件流只在有疑点时 grep。
     $raw1 = Join-Path $root '.codex-stream-find.jsonl'
     $notes1 = Join-Path $root 'codex_review_find.notes.md'
-    Add-LocalExclude $root @('.codex-stream-find.jsonl', 'codex_review_find.notes.md')
+    # 产出物全部补进本机 exclude：可写审查结束后要按「测试文件以外有没有改动」判合格，产出物不能算进去
+    Add-LocalExclude $root @('.codex-stream-find.jsonl', 'codex_review_find.notes.md', 'codex_review_find.md',
+        'codex_review_attack.md', '.codex-stream.jsonl', '.codex-prompt.txt', 'codex_report.md')
 
-    Write-Host "第 1 轮：找问题 | 强度 $Effort | $Review" -ForegroundColor Cyan
+    # 审查默认可写、只许动测试文件：docs/levels.md §4 要求第 2 层客观检查（跑测试）由验收方亲自跑、
+    # 边界测试由 Codex 写。原来审查写死只读沙箱，哪都写不了，vitest / pytest 建临时目录必报 EPERM
+    # （remote-pilot 11-03～11-19 审查 13 次），测试全落回实现方 Claude 自己跑 —— 和设计相反（用户 11-19 定）。
+    # 条件不满足就退回只读，并明说「别试测试」，免得 Codex 每次白跑一遍再报 EPERM。
+    $policyPy = Join-Path $PSScriptRoot 'dispatch_policy.py'
+    $testGlobs = Get-TestGlobs
+    $check = Get-CheckCommand
+    $why = ''
+    if ($ReviewReadOnly) { $why = '传了 -ReviewReadOnly' }
+    elseif (-not $testGlobs) { $why = '项目 .claude/codex-dispatch.json 没配 tests（审查方可写的测试文件 glob）' }
+    elseif (-not $check) { $why = '项目没配 check' }
+    else {
+        $outside = @(& $py $policyPy check-only-in --root $root --globs $testGlobs)
+        if ($LASTEXITCODE -eq 2) {
+            $why = "判断不了工作树改动（$($outside[0])）"
+        } elseif ($LASTEXITCODE -ne 0) {
+            $why = "工作树里有测试文件以外的未提交改动（$($outside.Count) 个，如 $($outside[0])），分不清哪些是 Codex 改的；先提交"
+        } elseif ((Invoke-PreCheck $false) -ne 0) {
+            $why = 'check 在 Codex 沙箱里跑不了（见上面前置检查的输出）'
+        }
+    }
+    if ($why) {
+        $reviewSandbox = 'read-only'
+        Write-Host "审查走只读沙箱：$why。" -ForegroundColor Yellow
+        Write-Host "Codex 跑不了测试：第 2 层客观检查由 Claude 跑（有 CI 用 CI 在该提交上的结果），派活日志写明「第 2 层非验收方」。" -ForegroundColor Yellow
+        $modeNote = @"
+
+---
+（派活脚本附加）你在只读沙箱里：不能写任何文件，测试、类型检查、构建也跑不了（建临时目录会被拒，报 EPERM）。
+不要尝试运行它们或任何会写文件的命令，只读代码判断；测试由派活方在本机跑。
+"@
+        $modeNote2 = $modeNote
+    } else {
+        $reviewSandbox = 'workspace-write'
+        Write-Host "审查走可写沙箱，只许动测试文件（$testGlobs）；动了别的文件判不合格（退出码 3）" -ForegroundColor Cyan
+        $modeNote = @"
+
+---
+（派活脚本附加）你可以写测试，但**只能新增或修改匹配这些 glob 的文件：$testGlobs**（相对项目根）。
+改任何其他文件（源码、配置、文档）都会被判不合格。
+- 你认为成立的问题，尽量写一个能复现它的测试（问题存在时这个测试应当失败），在表格「依据」列写上测试文件和测试名
+- 需求里的边界情况没被现有测试覆盖的，补上
+- 不要为了让测试通过去改源码，也不要删改已有测试的断言
+- 最后跑一次 ``$check``，在回复末尾贴出：命令、退出码、失败用例的原始输出（最多 40 行）
+"@
+        $modeNote2 = @"
+
+---
+（派活脚本附加）核对时可以运行测试（包括第 1 轮新写的），判定依据里可以引用测试结果（测试名 + 失败输出）。
+需要的话可以新增测试来复现，但**只能新增或修改匹配这些 glob 的文件：$testGlobs**；改别的文件会被判不合格。
+"@
+    }
+
+    Write-Host "第 1 轮：找问题 | 强度 $Effort | 沙箱 $reviewSandbox | $Review" -ForegroundColor Cyan
     $p1 = @"
 审查这些文件：$Review
 
 严格按 AGENTS.md「代码审查任务的固定格式」输出表格。只报会出错的东西，不报风格问题。
 宁可少报 —— 每条都会被独立复核，假阳性比漏报代价大。
-"@
+"@ + $modeNote
     if ($Round2Only) {
         if (-not (Test-Path $r1)) {
             Write-Host "-Round2Only 需要已有的 $r1，但它不存在。先跑完整两轮。" -ForegroundColor Red
@@ -450,12 +532,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
         Write-Host "跳过第 1 轮，复用 $r1" -ForegroundColor DarkGray
     } else {
         Remove-Item $raw1, $notes1 -ErrorAction SilentlyContinue
-        $code = Invoke-Codex -Sandbox 'read-only' -OutFile $r1 -Prompt $p1
+        $code = Invoke-Codex -Sandbox $reviewSandbox -OutFile $r1 -Prompt $p1
         # 失败也存：中途断掉时能看到它做到了哪一步
         if (Test-Path $raw) {
             Copy-Item $raw $raw1 -Force
             & $py (Join-Path $PSScriptRoot 'codex_stream.py') --notes $raw1 $notes1 | Out-Null
         }
+        Assert-ReviewScope '第 1 轮'
     }
 
     if (-not (Test-Path $r1)) {
@@ -505,8 +588,19 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
 依据：<一句话，带 file:line>
 
 不要复述原报告的内容。
-"@
-    $code = Invoke-Codex -Sandbox 'read-only' -OutFile $r2 -Prompt $p2
+"@ + $modeNote2
+    $code = Invoke-Codex -Sandbox $reviewSandbox -OutFile $r2 -Prompt $p2
+    Assert-ReviewScope '第 2 轮'
+
+    if ($reviewSandbox -eq 'workspace-write') {
+        $tests = @(git -C $root status --porcelain --untracked-files=all | Where-Object { $_ -notmatch 'docs/dispatch-log\.md$' })
+        if ($tests.Count) {
+            Write-Host "`nCodex 写 / 改的测试（验收方产出，Claude 本机跑一遍：复现真问题的留下随修复提交，其余删掉）：" -ForegroundColor Yellow
+            $tests | ForEach-Object { Write-Host "  $_" }
+        } else {
+            Write-Host "`nCodex 没写测试。它跑 check 的结果看两份报告末尾。" -ForegroundColor DarkGray
+        }
+    }
 
     Write-Host "`n第 1 轮 $r1" -ForegroundColor Green
     Write-Host "第 2 轮 $r2" -ForegroundColor Green
@@ -516,7 +610,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Review') {
     }
     Write-Host "第 1 轮事件流：$raw1"
     Write-Host "第 2 轮事件流：$raw"
-    & $py (Join-Path $PSScriptRoot 'dispatch_policy.py') --cwd $root record-codex --mode read | Out-Null
+    if ($reviewSandbox -eq 'workspace-write') {
+        & $py $policyPy record-codex-from-git --root $root | Out-Host
+    } else {
+        & $py $policyPy --cwd $root record-codex --mode read | Out-Null
+    }
     exit $code
 }
 
@@ -541,8 +639,8 @@ if ($Mode -eq 'write') {
     & $py $policy record-codex-from-git --root $root | Out-Host
     if ($Protect) {
         $bad = & $py $policy check-protected --root $root --globs $Protect
-        if ($LASTEXITCODE -eq 1) {
-            Write-Host "`n不合格：改了受保护路径（$Protect）：" -ForegroundColor Red
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "`n不合格：改了受保护路径（$Protect），或改动范围判断不了：" -ForegroundColor Red
             $bad | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
             Write-Host "验收测试由非实现方编写，Codex 不得修改。回滚后重派，并在需求里写明不许动这些文件。" -ForegroundColor Yellow
             exit 3

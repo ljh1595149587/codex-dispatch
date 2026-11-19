@@ -42,6 +42,7 @@ $S = Split-Path (Split-Path $D -Parent) -Parent
 - **Codex 实现 → Claude 验收**：动手前 Claude 按需求写验收测试，派活时用 `-Protect "tests/acceptance/*"` 保护它们
   （Codex 改了受保护路径脚本直接退出码 3）；只看 `git diff` 和自己跑的命令输出
 - **Claude 实现 → Codex 验收**：`-Review` 两轮审查，并在说明里附针对性清单（如「列出 X 的所有调用点逐个确认」）。
+  审查默认走**可写沙箱、只许动测试文件**：Codex 写复现 / 边界测试、跑 check，第 2 层由验收方跑（见下文「审查可写」）。
   **驳回 Codex 的发现必须给证据**（测试或 file:line），驳回条目记进派活日志
 - 风险定验收深度，与档位无关：高风险（迁移、计费、鉴权、并发、部署）四层全做
 - task_plan.md 每个阶段的「执行者 / 验收者 / 风险 / 验收证据」由 planning-with-files-zh 的模板提供，照填
@@ -87,6 +88,13 @@ $S = Split-Path (Split-Path $D -Parent) -Parent
 - 退出码 4 多半是沙箱账号（组 CodexSandboxUsers）读不到某个安装目录：`icacls <目录>` 查，
   缺就请用户执行 `icacls <目录> /grant 'CodexSandboxUsers:(OI)(CI)RX'`（改权限由用户自己经手）
 - 没配 check 时只提示、不拦
+
+**审查可写（11-19 起）**：项目 `.claude/codex-dispatch.json` 再配 `"tests": ["**/*.test.ts", "tests/**"]`（审查方可写的测试文件 glob，
+fnmatch，`*` 跨目录）。`-Review` 时 tests、check 都配了、测试文件以外没有未提交改动、前置检查过 → 可写沙箱；
+每轮跑完查改动范围，动了测试文件以外的 = 不合格（退出码 3）。跑完列出 Codex 写的测试：Claude 本机跑一遍，复现真问题的留下随修复提交，其余删掉。
+- 任一条不满足就退回只读并打出原因（`-ReviewReadOnly` 强制只读），prompt 里明说「跑不了测试，别试」
+- **只读审查里的 EPERM 是预期的**（只读沙箱哪都写不了，vitest / pytest 建临时目录必失败），不是环境故障，不记成教训；
+  这时第 2 层由 Claude 本机跑或采用 CI 在该提交上的结果，派活日志写明「第 2 层非验收方」
 
 **推理强度 `-Effort`**：不传时审查用 high，其余用 medium，不跟 `~/.codex/config.toml` 的全局值走。
 核心代码、高风险改动手动传 high 或 ultra。强度越高，Codex 越会把边角情况挨个防一遍，写出没人要求的校验和重试。

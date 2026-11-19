@@ -407,6 +407,45 @@ class TestGit(Env):
         self.assertIn("tests/acceptance/x_test.go", out)
         self.assertEqual(self.policy("check-protected", "--root", self.proj, "--globs", "other/*")[0], 0)
 
+    def test_check_only_in(self):
+        """审查方只许动测试文件（11-19 审查改可写）：测试目录外有改动就退出 1 并列出。"""
+        self._commit_base()
+        os.makedirs(os.path.join(self.proj, "src"))
+        with open(os.path.join(self.proj, "src", "a.test.ts"), "w") as f:
+            f.write("x\n")
+        globs = "*.test.ts,tests/*"
+        self.assertEqual(self.policy("check-only-in", "--root", self.proj, "--globs", globs)[0], 0)
+        with open(os.path.join(self.proj, "src", "a.ts"), "w") as f:
+            f.write("y\n")
+        code, out = self.policy("check-only-in", "--root", self.proj, "--globs", globs)
+        self.assertEqual(code, 1)
+        self.assertIn("src/a.ts", out)
+        self.assertNotIn("a.test.ts", out)
+
+    def test_check_only_in_review_findings(self):
+        """11-19 Codex 审查 3 条：改名拆成删 + 增；没有首次提交时 git 出错退出 2；派活产出物不算改动。"""
+        g = ["git", "-C", self.proj, "-c", "user.name=t", "-c", "user.email=t@t"]
+        with open(os.path.join(self.proj, "a.go"), "w") as f:
+            f.write("one\n")
+        subprocess.run(g + ["add", "-A"], check=True)
+        code, out = self.policy("check-only-in", "--root", self.proj, "--globs", "tests/*")
+        self.assertEqual(code, 2, out)                      # ② 没有 HEAD：判断不了，不能当「没改动」
+        self.assertEqual(self.policy("check-protected", "--root", self.proj, "--globs", "x/*")[0], 2)
+        with open(os.path.join(self.proj, "codex_review_find.md"), "w") as f:
+            f.write("old\n")
+        subprocess.run(g + ["add", "-A"], check=True)
+        subprocess.run(g + ["commit", "-qm", "base"], check=True)
+        os.makedirs(os.path.join(self.proj, "tests"))
+        subprocess.run(g + ["mv", "a.go", "tests/a.go"], check=True)   # ① 源码挪进测试目录
+        code, out = self.policy("check-only-in", "--root", self.proj, "--globs", "tests/*")
+        self.assertEqual(code, 1)
+        self.assertIn("a.go", out.split())
+        subprocess.run(g + ["mv", "tests/a.go", "a.go"], check=True)
+        with open(os.path.join(self.proj, "codex_review_find.md"), "w") as f:   # ③ 已跟踪的产出物被重写
+            f.write("new\n")
+        code, out = self.policy("check-only-in", "--root", self.proj, "--globs", "tests/*")
+        self.assertEqual(code, 0, out)
+
 
 class TestReviewFindings(Env):
     """2026-10-26 Codex 两轮审查 8 条成立发现的回归测试（编号同审查表顺序）。"""

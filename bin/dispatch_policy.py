@@ -9,6 +9,7 @@
   python dispatch_policy.py record-codex --mode read
   python dispatch_policy.py record-codex-from-git --root <项目根>   # 写模式派活跑完后统计改动
   python dispatch_policy.py check-protected --root <项目根> --globs "tests/acceptance/**"
+  python dispatch_policy.py check-only-in --root <项目根> --globs "**/*.test.ts,tests/**"
   python dispatch_policy.py init-user [--budget ample|tight] [--default-level N]
   python dispatch_policy.py set-project-level N
 
@@ -701,13 +702,48 @@ def cmd_record_codex_from_git(a):
     return 0
 
 
-def cmd_check_protected(a):
+# 派活脚本自己的产出物：项目把它们提交进仓库时，重写一次也会出现在 diff 里，不算任何一方的改动
+DISPATCH_ARTIFACTS = frozenset((
+    "codex_report.md", "codex_review_find.md", "codex_review_attack.md", "codex_review_find.notes.md",
+    ".codex-stream.jsonl", ".codex-stream-find.jsonl", ".codex-prompt.txt",
+))
+
+
+def changed_paths(root):
+    """范围检查用：相对 HEAD 改动过的路径（含未跟踪），排除派活日志和产出物；git 出错返回 None。
+    和 git_changes 的两处不同（11-19 Codex 审查）：① --no-renames，改名拆成「删旧 + 增新」，
+    否则把源码挪进测试目录只看得到新路径，删掉的源码漏检；② 检查 git 退出码，没有首次提交时
+    git diff HEAD 失败、输出为空，原来被当成「没改动」放行。"""
+    paths = []
+    for args in (("diff", "--name-only", "--no-renames", "-z", "HEAD"),
+                 ("ls-files", "--others", "--exclude-standard", "-z")):
+        out = subprocess.run(["git", "-C", root] + list(args), capture_output=True)
+        if out.returncode != 0:
+            return None
+        paths += [p for p in out.stdout.decode("utf-8", "replace").split("\0") if p]
+    return [p for p in dict.fromkeys(paths) if not is_log(p) and p not in DISPATCH_ARTIFACTS]
+
+
+def _scope_check(a, bad_if):
     globs = [g.strip() for g in a.globs.split(",") if g.strip()]
-    _, _, _, files = git_changes(a.root)
-    bad = [f for f in files if match_any(f, globs)]
+    files = changed_paths(a.root)
+    if files is None:
+        _say("git 出错，判断不了改了哪些文件（仓库还没有首次提交？）")
+        return 2
+    bad = [f for f in files if bad_if(match_any(f, globs))]
     for f in bad:
         _say(f)
     return 1 if bad else 0
+
+
+def cmd_check_protected(a):
+    """写模式：改了受保护路径（匹配 globs）就退出 1；git 出错退出 2。"""
+    return _scope_check(a, lambda hit: hit)
+
+
+def cmd_check_only_in(a):
+    """审查方只许动测试文件：相对 HEAD 改动（含未跟踪）里有不匹配 globs 的就退出 1；git 出错退出 2。"""
+    return _scope_check(a, lambda hit: not hit)
 
 
 def cmd_init_user(a):
@@ -763,6 +799,9 @@ def main(argv=None):
     cp = sub.add_parser("check-protected")
     cp.add_argument("--root", required=True)
     cp.add_argument("--globs", required=True)
+    co = sub.add_parser("check-only-in")
+    co.add_argument("--root", required=True)
+    co.add_argument("--globs", required=True)
     iu = sub.add_parser("init-user")
     iu.add_argument("--budget", choices=list(BUDGETS))
     iu.add_argument("--default-level", type=int)
@@ -775,6 +814,7 @@ def main(argv=None):
     return {
         "status": cmd_status, "decide": cmd_decide, "override": cmd_override,
         "record-codex": cmd_record_codex, "check-protected": cmd_check_protected,
+        "check-only-in": cmd_check_only_in,
         "init-user": cmd_init_user, "set-project-level": cmd_set_project_level,
     }[a.cmd](a)
 
