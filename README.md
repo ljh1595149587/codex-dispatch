@@ -2,6 +2,11 @@
 
 派 Codex 干活的 CLI。Windows / PowerShell 环境，跨项目通用。
 
+> **适用范围**：只在 Windows 10/11 + Windows PowerShell 5.1 + [Codex CLI](https://github.com/openai/codex)
+> + [Claude Code](https://docs.anthropic.com/claude-code) 上用过；钩子需要 Python 3（只用标准库）。
+> 文档只有中文。钩子要手动合并进 `~/.claude/settings.json`（模板见 `docs/settings-hooks.json`），
+> 没有安装命令。MIT 许可，见 `LICENSE`。
+
 本仓库同时是一个 Claude Code skill（`SKILL.md` 在根目录），装在 `~/.claude/skills/`
 下（目录名即 skill 名）。skill 加载时读 `SKILL.md`，人和 CLI 用户读本文件。
 
